@@ -1,0 +1,586 @@
+repo_url,repo_owner,project_name,original_sha,fixed_sha,module,full_test_name,pr_link,flaky_code,fixed_code,diff,generated_patch,isCorrect,incorrect_type,incorrect_reason,rerun_consistency,time_consume,round1,same,source_file,augmented_source_marker,is_mutation,mutation_rule_id,mutation_iteration
+https://github.com/alibaba/jetcache,alibaba,jetcache,d28019640ac3eb6ac167dd0dc582adac7656226e,f2811b7c0715f0dc9e6efa4ba696ed691963485c,jetcache-test,com.alicp.jetcache.anno.support.ConfigProvider_CacheMessagePublisher_Test.test.test,https://github.com/alibaba/jetcache/pull/614,"public void test() {
+        CountBean bean = context.getBean(CountBean.class);
+        MyCacheMessagePublisher publisher = context.getBean(MyCacheMessagePublisher.class);
+        bean.cache.put(""K1"", ""V1"");
+        Assert.assertEquals(CacheMessage.TYPE_PUT, publisher.messageType);
+        Assert.assertEquals(""K1"", publisher.keys[0]);
+
+        Map kvs = Stream.of(new String[]{""K1"", ""V1_new""}, new String[]{""K2"", ""V2""})
+                .collect(Collectors.toMap(kv -> kv[0], kv -> kv[1]));
+        bean.cache.putAll(kvs);
+        Assert.assertEquals(CacheMessage.TYPE_PUT_ALL, publisher.messageType);
+        Assert.assertEquals(""K1"", publisher.keys[0]);
+        Assert.assertEquals(""K2"", publisher.keys[1]);
+
+        bean.cache.remove(""K3"");
+        Assert.assertEquals(CacheMessage.TYPE_REMOVE, publisher.messageType);
+        Assert.assertEquals(""K3"", publisher.keys[0]);
+
+        Set keys = Stream.of(""K1"", ""K3"").collect(Collectors.toSet());
+        bean.cache.removeAll(keys);
+        Assert.assertEquals(CacheMessage.TYPE_REMOVE_ALL, publisher.messageType);
+        Assert.assertEquals(""K1"", publisher.keys[0]);
+        Assert.assertEquals(""K3"", publisher.keys[1]);
+    }","@Test
+    public void test() {
+        CountBean bean = context.getBean(CountBean.class);
+        MyCacheMessagePublisher publisher = context.getBean(MyCacheMessagePublisher.class);
+        bean.cache.put(""K1"", ""V1"");
+        Assert.assertEquals(CacheMessage.TYPE_PUT, publisher.messageType);
+        Assert.assertEquals(""K1"", publisher.keys[0]);
+
+        SortedMap<String, String> kvs = new TreeMap(Stream.of(new String[]{""K1"", ""V1_new""},
+                                                              new String[]{""K2"", ""V2""})
+                                                   .collect(Collectors.toMap(kv -> kv[0],
+                                                                             kv -> kv[1])));
+        bean.cache.putAll(kvs);
+        Assert.assertEquals(CacheMessage.TYPE_PUT_ALL, publisher.messageType);
+        Assert.assertEquals(""K1"", publisher.keys[0]);
+        Assert.assertEquals(""K2"", publisher.keys[1]);
+
+        bean.cache.remove(""K3"");
+        Assert.assertEquals(CacheMessage.TYPE_REMOVE, publisher.messageType);
+        Assert.assertEquals(""K3"", publisher.keys[0]);
+
+        SortedSet<String> keys = new TreeSet(Stream.of(""K1"", ""K3"")
+                                            .collect(Collectors.toSet()));
+        bean.cache.removeAll(keys);
+        Assert.assertEquals(CacheMessage.TYPE_REMOVE_ALL, publisher.messageType);
+        Assert.assertEquals(""K1"", publisher.keys[0]);
+        Assert.assertEquals(""K3"", publisher.keys[1]);
+    }","public void test() {
+        CountBean bean = context.getBean(CountBean.class);
+        MyCacheMessagePublisher publisher = context.getBean(MyCacheMessagePublisher.class);
+        bean.cache.put(""K1"", ""V1"");
+        Assert.assertEquals(CacheMessage.TYPE_PUT, publisher.messageType);
+        Assert.assertEquals(""K1"", publisher.keys[0]);
+
+-        Map kvs = Stream.of(new String[]{""K1"", ""V1_new""}, new String[]{""K2"", ""V2""})
+                .collect(Collectors.toMap(kv -> kv[0], kv -> kv[1]));
+
++        SortedMap<String, String> kvs = new TreeMap(Stream.of(new String[]{""K1"", ""V1_new""},
+                                                              new String[]{""K2"", ""V2""})
+                                                   .collect(Collectors.toMap(kv -> kv[0],
+                                                                             kv -> kv[1])));
+        bean.cache.putAll(kvs);
+        Assert.assertEquals(CacheMessage.TYPE_PUT_ALL, publisher.messageType);
+        Assert.assertEquals(""K1"", publisher.keys[0]);
+        Assert.assertEquals(""K2"", publisher.keys[1]);
+
+        bean.cache.remove(""K3"");
+        Assert.assertEquals(CacheMessage.TYPE_REMOVE, publisher.messageType);
+        Assert.assertEquals(""K3"", publisher.keys[0]);
+
+-        Set keys = Stream.of(""K1"", ""K3"").collect(Collectors.toSet());
++        SortedSet<String> keys = new TreeSet(Stream.of(""K1"", ""K3"")
+                                            .collect(Collectors.toSet()));
+        bean.cache.removeAll(keys);
+        Assert.assertEquals(CacheMessage.TYPE_REMOVE_ALL, publisher.messageType);
+        Assert.assertEquals(""K1"", publisher.keys[0]);
+        Assert.assertEquals(""K3"", publisher.keys[1]);
+    }","public void test() {
+    CountBean bean = context.getBean(CountBean.class);
+    MyCacheMessagePublisher publisher = context.getBean(MyCacheMessagePublisher.class);
+    bean.cache.put(""K1"", ""V1"");
+    Assert.assertEquals(CacheMessage.TYPE_PUT, publisher.messageType);
+    Assert.assertEquals(""K1"", publisher.keys[0]);
+
+    Map kvs = Stream.of(new String[]{""K1"", ""V1_new""}, new String[]{""K2"", ""V2""})
+            .collect(Collectors.toMap(kv -> kv[0], kv -> kv[1], (a, b) -> b, LinkedHashMap::new));
+    bean.cache.putAll(kvs);
+    Assert.assertEquals(CacheMessage.TYPE_PUT_ALL, publisher.messageType);
+    Assert.assertTrue(Arrays.asList(publisher.keys).containsAll(Arrays.asList(""K1"", ""K2"")));
+
+    bean.cache.remove(""K3"");
+    Assert.assertEquals(CacheMessage.TYPE_REMOVE, publisher.messageType);
+    Assert.assertEquals(""K3"", publisher.keys[0]);
+
+    Set keys = Stream.of(""K1"", ""K3"").collect(Collectors.toCollection(LinkedHashSet::new));
+    bean.cache.removeAll(keys);
+    Assert.assertEquals(CacheMessage.TYPE_REMOVE_ALL, publisher.messageType);
+    Assert.assertTrue(Arrays.asList(publisher.keys).containsAll(Arrays.asList(""K1"", ""K3"")));
+}",1.0,,,1.0,31.02246199,"public void test() {
+    CountBean bean = context.getBean(CountBean.class);
+    MyCacheMessagePublisher publisher = context.getBean(MyCacheMessagePublisher.class);
+    bean.cache.put(""K1"", ""V1"");
+    Assert.assertEquals(CacheMessage.TYPE_PUT, publisher.messageType);
+    Assert.assertEquals(""K1"", publisher.keys[0]);
+
+    Map kvs = Stream.of(new String[]{""K1"", ""V1_new""}, new String[]{""K2"", ""V2""})
+            .collect(Collectors.toMap(kv -> kv[0], kv -> kv[1], (a, b) -> b, LinkedHashMap::new));
+    bean.cache.putAll(kvs);
+    Assert.assertEquals(CacheMessage.TYPE_PUT_ALL, publisher.messageType);
+    Assert.assertTrue(Arrays.asList(publisher.keys).containsAll(Arrays.asList(""K1"", ""K2"")));
+
+    bean.cache.remove(""K3"");
+    Assert.assertEquals(CacheMessage.TYPE_REMOVE, publisher.messageType);
+    Assert.assertEquals(""K3"", publisher.keys[0]);
+
+    Set keys = Stream.of(""K1"", ""K3"").collect(Collectors.toCollection(LinkedHashSet::new));
+    bean.cache.removeAll(keys);
+    Assert.assertEquals(CacheMessage.TYPE_REMOVE_ALL, publisher.messageType);
+    Assert.assertTrue(Arrays.asList(publisher.keys).containsAll(Arrays.asList(""K1"", ""K3"")));
+}",1.0,flaky_doctor_131_gpt_fixed_checked_labeled_time.csv,flakydoctor_original,FALSE,,
+https://github.com/alibaba/fastjson,alibaba,fastjson,e05e9c5e4be580691cc55a59f3256595393203a1,1e25425fb0edd1334cb9e991971075c383ef1ac8,.,com.alibaba.json.bvt.guava.ArrayListMultimapTest.test_for_multimap.test_for_multimap,https://github.com/alibaba/fastjson/pull/3502,"public void test_for_multimap() throws Exception {
+        ArrayListMultimap<String, Integer> multimap = ArrayListMultimap.create();
+        multimap.putAll(""b"", Ints.asList(2, 4, 6));
+        multimap.putAll(""a"", Ints.asList(4, 2, 1));
+        multimap.putAll(""c"", Ints.asList(2, 5, 3));
+
+
+        String json = JSON.toJSONString(multimap);
+        assertEquals(""{\""a\"":[4,2,1],\""b\"":[2,4,6],\""c\"":[2,5,3]}"", json);
+
+        TreeMultimap treeMultimap = TreeMultimap.create(multimap);
+        String json2 = JSON.toJSONString(treeMultimap);
+        assertEquals(""{\""a\"":[1,2,4],\""b\"":[2,4,6],\""c\"":[2,3,5]}"", json2);
+    }","public void test_for_multimap() throws Exception {
+        ArrayListMultimap<String, Integer> multimap = ArrayListMultimap.create();
+        multimap.putAll(""b"", Ints.asList(2, 4, 6));
+        multimap.putAll(""a"", Ints.asList(4, 2, 1));
+        multimap.putAll(""c"", Ints.asList(2, 5, 3));
+
+        String json = JSON.toJSONString(multimap, SerializerFeature.MapSortField);
+        assertEquals(""{\""a\"":[4,2,1],\""b\"":[2,4,6],\""c\"":[2,5,3]}"", json);
+
+        TreeMultimap treeMultimap = TreeMultimap.create(multimap);
+        String json2 = JSON.toJSONString(treeMultimap);
+        assertEquals(""{\""a\"":[1,2,4],\""b\"":[2,4,6],\""c\"":[2,3,5]}"", json2);
+    }","public void test_for_multimap() throws Exception {
+        ArrayListMultimap<String, Integer> multimap = ArrayListMultimap.create();
+        multimap.putAll(""b"", Ints.asList(2, 4, 6));
+        multimap.putAll(""a"", Ints.asList(4, 2, 1));
+        multimap.putAll(""c"", Ints.asList(2, 5, 3));
+
+-        String json = JSON.toJSONString(multimap);
++        String json = JSON.toJSONString(multimap, SerializerFeature.MapSortField);
+        assertEquals(""{\""a\"":[4,2,1],\""b\"":[2,4,6],\""c\"":[2,5,3]}"", json);
+
+        TreeMultimap treeMultimap = TreeMultimap.create(multimap);
+        String json2 = JSON.toJSONString(treeMultimap);
+        assertEquals(""{\""a\"":[1,2,4],\""b\"":[2,4,6],\""c\"":[2,3,5]}"", json2);
+    }","public void test_for_multimap() throws Exception {
+    ArrayListMultimap<String, Integer> multimap = ArrayListMultimap.create();
+    multimap.putAll(""b"", Ints.asList(2, 4, 6));
+    multimap.putAll(""a"", Ints.asList(4, 2, 1));
+    multimap.putAll(""c"", Ints.asList(2, 5, 3));
+
+    String json = JSON.toJSONString(multimap);
+    Map<String, List<Integer>> parsedJson = JSON.parseObject(json, new TypeReference<Map<String, List<Integer>>>() {});
+    assertEquals(parsedJson.get(""a""), Arrays.asList(4, 2, 1));
+    assertEquals(parsedJson.get(""b""), Arrays.asList(2, 4, 6));
+    assertEquals(parsedJson.get(""c""), Arrays.asList(2, 5, 3));
+
+    TreeMultimap treeMultimap = TreeMultimap.create(multimap);
+    String json2 = JSON.toJSONString(treeMultimap);
+    assertEquals(""{\""a\"":[1,2,4],\""b\"":[2,4,6],\""c\"":[2,3,5]}"", json2);
+}",1.0,,,1.0,25.48443021,"public void test_for_multimap() throws Exception {
+    ArrayListMultimap<String, Integer> multimap = ArrayListMultimap.create();
+    multimap.putAll(""b"", Ints.asList(2, 4, 6));
+    multimap.putAll(""a"", Ints.asList(4, 2, 1));
+    multimap.putAll(""c"", Ints.asList(2, 5, 3));
+
+    String json = JSON.toJSONString(multimap);
+    Map<String, List<Integer>> parsedJson = JSON.parseObject(json, new TypeReference<Map<String, List<Integer>>>() {});
+    assertEquals(parsedJson.get(""a""), Arrays.asList(4, 2, 1));
+    assertEquals(parsedJson.get(""b""), Arrays.asList(2, 4, 6));
+    assertEquals(parsedJson.get(""c""), Arrays.asList(2, 5, 3));
+
+    TreeMultimap treeMultimap = TreeMultimap.create(multimap);
+    String json2 = JSON.toJSONString(treeMultimap);
+    assertEquals(""{\""a\"":[1,2,4],\""b\"":[2,4,6],\""c\"":[2,3,5]}"", json2);
+}",1.0,flaky_doctor_131_gpt_fixed_checked_labeled_time.csv,flakydoctor_original,FALSE,,
+https://github.com/alibaba/fastjson,alibaba,fastjson,e05e9c5e4be580691cc55a59f3256595393203a1,65ae52b6b646560dbdeb33991ebb49d0e4f91eea,.,com.alibaba.json.bvt.issue_1100.Issue1177_2.test_for_issue.test_for_issue,https://github.com/alibaba/fastjson/pull/3042,"public void test_for_issue() throws Exception {
+        String text = ""{\""a\"":{\""x\"":\""y\""},\""b\"":{\""x\"":\""y\""}}"";
+        Map<String, Model> jsonObject = JSONObject.parseObject(text, new TypeReference<Map<String, Model>>(){});
+        System.out.println(JSON.toJSONString(jsonObject));
+        String jsonpath = ""$..x"";
+        String value=""y2"";
+        JSONPath.set(jsonObject, jsonpath, value);
+        assertEquals(""{\""a\"":{\""x\"":\""y2\""},\""b\"":{\""x\"":\""y2\""}}"", JSON.toJSONString(jsonObject));
+
+    }","public void test_for_issue() throws Exception {
+        String text = ""{\""a\"":{\""x\"":\""y\""},\""b\"":{\""x\"":\""y\""}}"";
+        Map<String, Model> jsonObject = JSONObject.parseObject(text, new TypeReference<LinkedHashMap<String, Model>>(){});
+        System.out.println(JSON.toJSONString(jsonObject));
+        String jsonpath = ""$..x"";
+        String value=""y2"";
+        JSONPath.set(jsonObject, jsonpath, value);
+        assertEquals(""{\""a\"":{\""x\"":\""y2\""},\""b\"":{\""x\"":\""y2\""}}"", JSON.toJSONString(jsonObject));
+
+    }","public void test_for_issue() throws Exception {
+        String text = ""{\""a\"":{\""x\"":\""y\""},\""b\"":{\""x\"":\""y\""}}"";
+-        Map<String, Model> jsonObject = JSONObject.parseObject(text, new TypeReference<Map<String, Model>>(){});
++        Map<String, Model> jsonObject = JSONObject.parseObject(text, new TypeReference<LinkedHashMap<String, Model>>(){});
+        System.out.println(JSON.toJSONString(jsonObject));
+        String jsonpath = ""$..x"";
+        String value=""y2"";
+        JSONPath.set(jsonObject, jsonpath, value);
+        assertEquals(""{\""a\"":{\""x\"":\""y2\""},\""b\"":{\""x\"":\""y2\""}}"", JSON.toJSONString(jsonObject));
+
+    }","public void test_for_issue() throws Exception {
+    String text = ""{\""a\"":{\""x\"":\""y\""},\""b\"":{\""x\"":\""y\""}}"";
+    Map<String, Model> jsonObject = JSONObject.parseObject(text, new TypeReference<Map<String, Model>>(){});
+    System.out.println(JSON.toJSONString(jsonObject));
+    String jsonpath = ""$..x"";
+    String value=""y2"";
+    JSONPath.set(jsonObject, jsonpath, value);
+    
+    Map<String, Object> expected = new LinkedHashMap<String, Object>();
+    Map<String, Object> aMap = new LinkedHashMap<String, Object>();
+    aMap.put(""x"", ""y2"");
+    Map<String, Object> bMap = new LinkedHashMap<String, Object>();
+    bMap.put(""x"", ""y2"");
+    expected.put(""a"", aMap);
+    expected.put(""b"", bMap);
+    
+    assertEquals(new ObjectMapper().readTree(JSON.toJSONString(expected)), 
+                new ObjectMapper().readTree(JSON.toJSONString(jsonObject)));
+}",1.0,,,1.0,85.87146478,"public void test_for_issue() throws Exception {
+    String text = ""{\""a\"":{\""x\"":\""y\""},\""b\"":{\""x\"":\""y\""}}"";
+    Map<String, Model> jsonObject = JSONObject.parseObject(text, new TypeReference<Map<String, Model>>(){});
+    System.out.println(JSON.toJSONString(jsonObject));
+    String jsonpath = ""$..x"";
+    String value=""y2"";
+    JSONPath.set(jsonObject, jsonpath, value);
+    
+    Map<String, Object> expected = new LinkedHashMap<>();
+    Map<String, Object> aMap = new LinkedHashMap<>();
+    aMap.put(""x"", ""y2"");
+    Map<String, Object> bMap = new LinkedHashMap<>();
+    bMap.put(""x"", ""y2"");
+    expected.put(""a"", aMap);
+    expected.put(""b"", bMap);
+    
+    assertEquals(JSON.toJSONString(expected), JSON.toJSONString(jsonObject));
+}",0.0,flaky_doctor_131_gpt_fixed_checked_labeled_time.csv,flakydoctor_original,FALSE,,
+https://github.com/alibaba/fastjson,alibaba,fastjson,e05e9c5e4be580691cc55a59f3256595393203a1,0f4379b58cc54e8e4429770f32f8e1c86202a028,.,com.alibaba.json.bvt.issue_1400.Issue1480.test_for_issue.test_for_issue,https://github.com/alibaba/fastjson/pull/3025,"public void test_for_issue() throws Exception {
+
+        Map<Integer,Integer> map = new HashMap<Integer,Integer>();
+        map.put(1,10);
+        map.put(2,4);
+        map.put(3,5);
+        map.put(4,5);
+        map.put(37306,98);
+        map.put(36796,9);
+
+        String json = JSON.toJSONString(map);
+        System.out.println(json);
+        Assert.assertEquals(""{1:10,2:4,3:5,4:5,37306:98,36796:9}"",json);
+
+        Map<Integer,Integer> map1 = JSON.parseObject(json,new TypeReference<HashMap<Integer,Integer>>() {});
+
+        Assert.assertEquals(map1.get(Integer.valueOf(1)),Integer.valueOf(10));
+        Assert.assertEquals(map1.get(Integer.valueOf(2)),Integer.valueOf(4));
+        Assert.assertEquals(map1.get(Integer.valueOf(3)),Integer.valueOf(5));
+        Assert.assertEquals(map1.get(Integer.valueOf(4)),Integer.valueOf(5));
+        Assert.assertEquals(map1.get(Integer.valueOf(37306)),Integer.valueOf(98));
+        Assert.assertEquals(map1.get(Integer.valueOf(36796)),Integer.valueOf(9));
+
+        JSONObject map2 = JSON.parseObject(""{35504:1,1:10,2:4,3:5,4:5,37306:98,36796:9\n"" + ""}"");
+
+        Assert.assertEquals(map2.get(Integer.valueOf(1)),Integer.valueOf(10));
+        Assert.assertEquals(map2.get(Integer.valueOf(2)),Integer.valueOf(4));
+        Assert.assertEquals(map2.get(Integer.valueOf(3)),Integer.valueOf(5));
+        Assert.assertEquals(map2.get(Integer.valueOf(4)),Integer.valueOf(5));
+        Assert.assertEquals(map2.get(Integer.valueOf(37306)),Integer.valueOf(98));
+        Assert.assertEquals(map2.get(Integer.valueOf(36796)),Integer.valueOf(9));
+
+    }","public void test_for_issue() throws Exception {
+
+        Map<Integer,Integer> map = new LinkedHashMap<Integer,Integer>();
+        map.put(1,10);
+        map.put(2,4);
+        map.put(3,5);
+        map.put(4,5);
+        map.put(37306,98);
+        map.put(36796,9);
+
+        String json = JSON.toJSONString(map);
+        System.out.println(json);
+        Assert.assertEquals(""{1:10,2:4,3:5,4:5,37306:98,36796:9}"",json);
+
+        Map<Integer,Integer> map1 = JSON.parseObject(json,new TypeReference<HashMap<Integer,Integer>>() {});
+
+        Assert.assertEquals(map1.get(Integer.valueOf(1)),Integer.valueOf(10));
+        Assert.assertEquals(map1.get(Integer.valueOf(2)),Integer.valueOf(4));
+        Assert.assertEquals(map1.get(Integer.valueOf(3)),Integer.valueOf(5));
+        Assert.assertEquals(map1.get(Integer.valueOf(4)),Integer.valueOf(5));
+        Assert.assertEquals(map1.get(Integer.valueOf(37306)),Integer.valueOf(98));
+        Assert.assertEquals(map1.get(Integer.valueOf(36796)),Integer.valueOf(9));
+
+        JSONObject map2 = JSON.parseObject(""{35504:1,1:10,2:4,3:5,4:5,37306:98,36796:9\n"" + ""}"");
+
+        Assert.assertEquals(map2.get(Integer.valueOf(1)),Integer.valueOf(10));
+        Assert.assertEquals(map2.get(Integer.valueOf(2)),Integer.valueOf(4));
+        Assert.assertEquals(map2.get(Integer.valueOf(3)),Integer.valueOf(5));
+        Assert.assertEquals(map2.get(Integer.valueOf(4)),Integer.valueOf(5));
+        Assert.assertEquals(map2.get(Integer.valueOf(37306)),Integer.valueOf(98));
+        Assert.assertEquals(map2.get(Integer.valueOf(36796)),Integer.valueOf(9));
+
+    }","public void test_for_issue() throws Exception {
+
+-        Map<Integer,Integer> map = new HashMap<Integer,Integer>();
++        Map<Integer,Integer> map = new LinkedHashMap<Integer,Integer>();
+        map.put(1,10);
+        map.put(2,4);
+        map.put(3,5);
+        map.put(4,5);
+        map.put(37306,98);
+        map.put(36796,9);
+
+        String json = JSON.toJSONString(map);
+        System.out.println(json);
+        Assert.assertEquals(""{1:10,2:4,3:5,4:5,37306:98,36796:9}"",json);
+
+        Map<Integer,Integer> map1 = JSON.parseObject(json,new TypeReference<HashMap<Integer,Integer>>() {});
+
+        Assert.assertEquals(map1.get(Integer.valueOf(1)),Integer.valueOf(10));
+        Assert.assertEquals(map1.get(Integer.valueOf(2)),Integer.valueOf(4));
+        Assert.assertEquals(map1.get(Integer.valueOf(3)),Integer.valueOf(5));
+        Assert.assertEquals(map1.get(Integer.valueOf(4)),Integer.valueOf(5));
+        Assert.assertEquals(map1.get(Integer.valueOf(37306)),Integer.valueOf(98));
+        Assert.assertEquals(map1.get(Integer.valueOf(36796)),Integer.valueOf(9));
+
+        JSONObject map2 = JSON.parseObject(""{35504:1,1:10,2:4,3:5,4:5,37306:98,36796:9\n"" + ""}"");
+
+        Assert.assertEquals(map2.get(Integer.valueOf(1)),Integer.valueOf(10));
+        Assert.assertEquals(map2.get(Integer.valueOf(2)),Integer.valueOf(4));
+        Assert.assertEquals(map2.get(Integer.valueOf(3)),Integer.valueOf(5));
+        Assert.assertEquals(map2.get(Integer.valueOf(4)),Integer.valueOf(5));
+        Assert.assertEquals(map2.get(Integer.valueOf(37306)),Integer.valueOf(98));
+        Assert.assertEquals(map2.get(Integer.valueOf(36796)),Integer.valueOf(9));
+
+    }","public void test_for_issue() throws Exception {
+    Map<Integer,Integer> map = new LinkedHashMap<Integer,Integer>();
+    map.put(1,10);
+    map.put(2,4);
+    map.put(3,5);
+    map.put(4,5);
+    map.put(37306,98);
+    map.put(36796,9);
+
+    String json = JSON.toJSONString(map);
+    ReadContext ctx = JsonPath.parse(json);
+    
+    Assert.assertEquals(Integer.valueOf(10), ctx.read(""$['1']""));
+    Assert.assertEquals(Integer.valueOf(4), ctx.read(""$['2']""));
+    Assert.assertEquals(Integer.valueOf(5), ctx.read(""$['3']""));
+    Assert.assertEquals(Integer.valueOf(5), ctx.read(""$['4']""));
+    Assert.assertEquals(Integer.valueOf(98), ctx.read(""$['37306']""));
+    Assert.assertEquals(Integer.valueOf(9), ctx.read(""$['36796']""));
+
+    Map<Integer,Integer> map1 = JSON.parseObject(json, new TypeReference<LinkedHashMap<Integer,Integer>>() {});
+
+    Assert.assertEquals(map1.get(Integer.valueOf(1)), Integer.valueOf(10));
+    Assert.assertEquals(map1.get(Integer.valueOf(2)), Integer.valueOf(4));
+    Assert.assertEquals(map1.get(Integer.valueOf(3)), Integer.valueOf(5));
+    Assert.assertEquals(map1.get(Integer.valueOf(4)), Integer.valueOf(5));
+    Assert.assertEquals(map1.get(Integer.valueOf(37306)), Integer.valueOf(98));
+    Assert.assertEquals(map1.get(Integer.valueOf(36796)), Integer.valueOf(9));
+
+    JSONObject map2 = JSON.parseObject(""{\""35504\"":1,\""1\"":10,\""2\"":4,\""3\"":5,\""4\"":5,\""37306\"":98,\""36796\"":9}"");
+
+    Assert.assertEquals(map2.get(Integer.valueOf(1)), Integer.valueOf(10));
+    Assert.assertEquals(map2.get(Integer.valueOf(2)), Integer.valueOf(4));
+    Assert.assertEquals(map2.get(Integer.valueOf(3)), Integer.valueOf(5));
+    Assert.assertEquals(map2.get(Integer.valueOf(4)), Integer.valueOf(5));
+    Assert.assertEquals(map2.get(Integer.valueOf(37306)), Integer.valueOf(98));
+    Assert.assertEquals(map2.get(Integer.valueOf(36796)), Integer.valueOf(9));
+}",1.0,,,1.0,72.15887528,"public void test_for_issue() throws Exception {
+    Map<Integer,Integer> map = new LinkedHashMap<Integer,Integer>();
+    map.put(1,10);
+    map.put(2,4);
+    map.put(3,5);
+    map.put(4,5);
+    map.put(37306,98);
+    map.put(36796,9);
+
+    String json = JSON.toJSONString(map);
+    System.out.println(json);
+    Assert.assertEquals(""{\""1\"":10,\""2\"":4,\""3\"":5,\""4\"":5,\""37306\"":98,\""36796\"":9}"", json);
+
+    Map<Integer,Integer> map1 = JSON.parseObject(json, new TypeReference<LinkedHashMap<Integer,Integer>>() {});
+
+    Assert.assertEquals(map1.get(Integer.valueOf(1)), Integer.valueOf(10));
+    Assert.assertEquals(map1.get(Integer.valueOf(2)), Integer.valueOf(4));
+    Assert.assertEquals(map1.get(Integer.valueOf(3)), Integer.valueOf(5));
+    Assert.assertEquals(map1.get(Integer.valueOf(4)), Integer.valueOf(5));
+    Assert.assertEquals(map1.get(Integer.valueOf(37306)), Integer.valueOf(98));
+    Assert.assertEquals(map1.get(Integer.valueOf(36796)), Integer.valueOf(9));
+
+    JSONObject map2 = JSON.parseObject(""{\""35504\"":1,\""1\"":10,\""2\"":4,\""3\"":5,\""4\"":5,\""37306\"":98,\""36796\"":9}"");
+
+    Assert.assertEquals(map2.get(Integer.valueOf(1)), Integer.valueOf(10));
+    Assert.assertEquals(map2.get(Integer.valueOf(2)), Integer.valueOf(4));
+    Assert.assertEquals(map2.get(Integer.valueOf(3)), Integer.valueOf(5));
+    Assert.assertEquals(map2.get(Integer.valueOf(4)), Integer.valueOf(5));
+    Assert.assertEquals(map2.get(Integer.valueOf(37306)), Integer.valueOf(98));
+    Assert.assertEquals(map2.get(Integer.valueOf(36796)), Integer.valueOf(9));
+}",0.0,flaky_doctor_131_gpt_fixed_checked_labeled_time.csv,flakydoctor_original,FALSE,,
+https://github.com/alibaba/fastjson,alibaba,fastjson,e05e9c5e4be580691cc55a59f3256595393203a1,433398d5fdff70e4f719b28d21a71ec13b625c71,.,com.alibaba.json.bvt.issue_1500.Issue1584.test_for_issue.test_for_issue,https://github.com/alibaba/fastjson/pull/3570,"public void test_for_issue() throws Exception {
+        ParserConfig config = new ParserConfig();
+
+        String json = ""{\""k\"":1,\""v\"":\""A\""}"";
+
+        {
+            Map.Entry entry = JSON.parseObject(json, Map.Entry.class, config);
+            assertEquals(""v"", entry.getKey());
+            assertEquals(""A"", entry.getValue());
+        }
+
+        config.putDeserializer(Map.Entry.class, new ObjectDeserializer() {
+            public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName) {
+                JSONObject object = parser.parseObject();
+                Object k = object.get(""k"");
+                Object v = object.get(""v"");
+
+                return (T) Collections.singletonMap(k, v).entrySet().iterator().next();
+            }
+
+            public int getFastMatchToken() {
+                return 0;
+            }
+        });
+
+        Map.Entry entry = JSON.parseObject(json, Map.Entry.class, config);
+        assertEquals(1, entry.getKey());
+        assertEquals(""A"", entry.getValue());
+    }","public void test_for_issue() throws Exception {
+        ParserConfig config = new ParserConfig();
+
+        String json = ""{\""k\"":1,\""v\"":\""A\""}"";
+
+        {
+            Map.Entry entry = JSON.parseObject(json, Map.Entry.class, config);
+            Object key = entry.getKey();
+            Object value = entry.getValue();
+            assertTrue(key.equals(""v"") || key.equals(""k""));
+            if (key.equals(""v"")) {
+                assertEquals(""A"", value);
+            } else {
+                assertEquals(1, value);
+            }
+        }
+
+        config.putDeserializer(Map.Entry.class, new ObjectDeserializer() {
+            public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName) {
+                JSONObject object = parser.parseObject();
+                Object k = object.get(""k"");
+                Object v = object.get(""v"");
+
+                return (T) Collections.singletonMap(k, v).entrySet().iterator().next();
+            }
+
+            public int getFastMatchToken() {
+                return 0;
+            }
+        });
+
+        Map.Entry entry = JSON.parseObject(json, Map.Entry.class, config);
+        assertEquals(1, entry.getKey());
+        assertEquals(""A"", entry.getValue());
+    }","public void test_for_issue() throws Exception {
+        ParserConfig config = new ParserConfig();
+
+        String json = ""{\""k\"":1,\""v\"":\""A\""}"";
+
+        {
+            Map.Entry entry = JSON.parseObject(json, Map.Entry.class, config);
+-            assertEquals(""v"", entry.getKey());
+-            assertEquals(""A"", entry.getValue());
++            Object key = entry.getKey();
++            Object value = entry.getValue();
++            assertTrue(key.equals(""v"") || key.equals(""k""));
++            if (key.equals(""v"")) {
+                assertEquals(""A"", value);
++            } else {
+                assertEquals(1, value);
+            }
+        }
+
+        config.putDeserializer(Map.Entry.class, new ObjectDeserializer() {
+            public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName) {
+                JSONObject object = parser.parseObject();
+                Object k = object.get(""k"");
+                Object v = object.get(""v"");
+
+                return (T) Collections.singletonMap(k, v).entrySet().iterator().next();
+            }
+
+            public int getFastMatchToken() {
+                return 0;
+            }
+        });
+
+        Map.Entry entry = JSON.parseObject(json, Map.Entry.class, config);
+        assertEquals(1, entry.getKey());
+        assertEquals(""A"", entry.getValue());
+    }","public void test_for_issue() throws Exception {
+    ParserConfig config = new ParserConfig();
+
+    String json = ""{\""k\"":1,\""v\"":\""A\""}"";
+
+    {
+        Map.Entry entry = JSON.parseObject(json, Map.Entry.class, config);
+        // Check both possible key-value pairs
+        if (entry.getKey().equals(""k"")) {
+            assertEquals(1, entry.getValue());
+        } else if (entry.getKey().equals(""v"")) {
+            assertEquals(""A"", entry.getValue());
+        } else {
+            fail(""Unexpected key in entry"");
+        }
+    }
+
+    config.putDeserializer(Map.Entry.class, new ObjectDeserializer() {
+        public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName) {
+            JSONObject object = parser.parseObject();
+            Object k = object.get(""k"");
+            Object v = object.get(""v"");
+
+            LinkedHashMap<Object, Object> map = new LinkedHashMap<Object, Object>();
+            map.put(k, v);
+            return (T) map.entrySet().iterator().next();
+        }
+
+        public int getFastMatchToken() {
+            return 0;
+        }
+    });
+
+    Map.Entry entry = JSON.parseObject(json, Map.Entry.class, config);
+    assertEquals(1, entry.getKey());
+    assertEquals(""A"", entry.getValue());
+}",1.0,,,1.0,101.4411646,"public void test_for_issue() throws Exception {
+    ParserConfig config = new ParserConfig();
+
+    String json = ""{\""k\"":1,\""v\"":\""A\""}"";
+
+    {
+        Map.Entry entry = JSON.parseObject(json, Map.Entry.class, config);
+        assertEquals(""v"", entry.getKey());
+        assertEquals(""A"", entry.getValue());
+    }
+
+    config.putDeserializer(Map.Entry.class, new ObjectDeserializer() {
+        public <T> T deserialze(DefaultJSONParser parser, Type type, Object fieldName) {
+            JSONObject object = parser.parseObject();
+            Object k = object.get(""k"");
+            Object v = object.get(""v"");
+
+            LinkedHashMap<Object, Object> map = new LinkedHashMap<>();
+            map.put(k, v);
+            return (T) map.entrySet().iterator().next();
+        }
+
+        public int getFastMatchToken() {
+            return 0;
+        }
+    });
+
+    Map.Entry entry = JSON.parseObject(json, Map.Entry.class, config);
+    assertEquals(1, entry.getKey());
+    assertEquals(""A"", entry.getValue());
+}",0.0,flaky_doctor_131_gpt_fixed_checked_labeled_time.csv,flakydoctor_original,FALSE,,
