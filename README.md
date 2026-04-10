@@ -536,24 +536,9 @@ python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --rerun 50 --runner st
 - 这种判断非常直观，适合先粗看瓶颈
 - 但它不能替代更细粒度的 profiler，只能做阶段级分析
 
-## 配置到其他电脑
+## 本地安装
 
-### 方案 A：Docker 优先
-
-适用场景：
-
-- 你希望最大化跨机器一致性
-- 你要跑批量实验
-
-优点：
-
-- 复现性最好
-- 对本地 JDK 依赖较小
-
-缺点：
-
-- 第一次拉镜像和依赖会比较慢
-- 需要保证 Docker 可用，且磁盘空间足够
+### Docker
 
 ```bash
 git clone <你的仓库地址> rerun-test  # 克隆本工具仓库到新电脑
@@ -563,36 +548,6 @@ python3 -m rerun_tool verify-patch --csv patch-data/cleaned_mutation_data.csv --
 python3 -m rerun_tool detect-flaky --repo-url https://github.com/SAP/emobility-smart-charging --sha 53c97ae60625a3e89a130213551840e455b74ae6 --full-test-name com.sap.charging.model.FuseTreeTest.testToJSON.testToJSON --module . --rerun 1 --docker auto -o results/migrate_detect_flaky.csv  # 用 patchless 单条检测检查新机器
 ```
 
-### 方案 B：本地构建优先
-
-适用场景：
-
-- 你没有 Docker
-- 你想直接在本机调试 Maven/Gradle/JDK 问题
-
-优点：
-
-- 启动更快
-- 更容易直接观察本机构建链问题
-
-缺点：
-
-- 对 JDK、Maven、Gradle 版本更敏感
-- 对旧 Java 项目不够稳定
-
-```bash
-python3 -m rerun_tool verify-patch --csv patch-data/cleaned_mutation_data.csv --limit 5 --rerun 3 --docker never -o results/local_verify_patch.csv  # 强制本地执行补丁验证
-python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --rerun 3 --runner standard --docker never -o results/local_detect_flaky.csv  # 强制本地执行 patchless 检测
-```
-
-### Windows 建议
-
-优先推荐 `WSL2 + Docker Desktop`。
-
-权衡：
-
-- 与当前命令行和路径习惯更接近
-- 比直接在纯 Windows `cmd` 下跑批量实验更稳定
 
 ## 常见问题
 
