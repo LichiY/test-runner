@@ -93,9 +93,15 @@ def _candidate_project_dirs(repo_dir: str, module: str) -> list:  # 为模块化
     return candidate_dirs  # 返回有序候选目录列表。
 
 
-def _detect_from_pom(pom_path: str) -> str:
+def _detect_from_pom(pom_path: str, seen_paths: Optional[set] = None) -> str:  # 支持沿着 Maven parent 链继续查找 Java 版本。
+    normalized_pom_path = os.path.abspath(pom_path)  # 先将 pom 路径规范化以便做循环检测。
+    if seen_paths is None:  # 第一次进入递归时初始化已访问集合。
+        seen_paths = set()  # 使用集合记录已经解析过的 pom 路径。
+    if normalized_pom_path in seen_paths:  # 如果当前 pom 已被访问过则停止递归。
+        return ''  # 避免 parent 链异常时出现无限递归。
+    seen_paths.add(normalized_pom_path)  # 记录当前 pom 已经开始解析。
     try:
-        with open(pom_path, 'r', encoding='utf-8', errors='ignore') as f:  # 以宽松模式读取 pom 文本。
+        with open(normalized_pom_path, 'r', encoding='utf-8', errors='ignore') as f:  # 以宽松模式读取 pom 文本。
             content = f.read()  # 读取完整 pom 内容以便做属性解析。
         properties = _extract_pom_properties(content)  # 先提取 properties 中的键值定义。
         patterns = [
@@ -120,9 +126,32 @@ def _detect_from_pom(pom_path: str) -> str:
             normalized = _normalize_java_version(resolved)  # 将结果规整成统一格式。
             if normalized:  # 只在解析成功时返回。
                 return normalized  # 返回最终的 source 版本。
+        parent_pom_path = _resolve_parent_pom_path(normalized_pom_path, content)  # 如果当前 pom 未声明 Java 版本则继续沿 parent 链查找。
+        if parent_pom_path and os.path.isfile(parent_pom_path):  # 只有本地 parent pom 存在时才递归解析。
+            inherited = _detect_from_pom(parent_pom_path, seen_paths)  # 递归读取 parent pom 中的 Java 版本信息。
+            if inherited:  # 一旦在 parent 链上找到版本就立即返回。
+                return inherited  # 返回从 parent pom 继承到的 Java 版本。
     except Exception:
         pass
     return ''
+
+
+def _resolve_parent_pom_path(pom_path: str, content: str) -> Optional[str]:  # 根据 <parent> 和 <relativePath> 解析本地 parent pom 路径。
+    parent_block_match = re.search(r'<parent>(.*?)</parent>', content, re.DOTALL)  # 尝试提取 parent 配置块。
+    if not parent_block_match:  # 没有 parent 块时无需继续解析。
+        return None  # 返回空值表示不存在本地父 pom。
+    parent_block = parent_block_match.group(1)  # 取出 parent 块内部文本。
+    relative_path_match = re.search(r'<relativePath>(.*?)</relativePath>', parent_block, re.DOTALL)  # 查找显式声明的 relativePath。
+    if relative_path_match is None:  # Maven 未显式声明 relativePath 时使用默认规则。
+        relative_path = '../pom.xml'  # Maven 的默认本地父 pom 路径是上一层目录的 pom.xml。
+    else:  # 存在显式 relativePath 时按其内容处理。
+        relative_path = relative_path_match.group(1).strip()  # 读取并去掉首尾空白。
+    if not relative_path:  # 空 relativePath 代表显式禁用本地 parent 查找。
+        return None  # 此时不能再按本地文件递归解析。
+    resolved_path = os.path.abspath(os.path.join(os.path.dirname(pom_path), relative_path))  # 基于当前 pom 目录拼出本地 parent 路径。
+    if os.path.isdir(resolved_path):  # 一些项目的 relativePath 指向的是父模块目录而不是具体 pom 文件。
+        resolved_path = os.path.join(resolved_path, 'pom.xml')  # 遇到目录路径时自动补全到该目录下的 pom.xml。
+    return resolved_path  # 返回最终解析出的本地 parent pom 绝对路径。
 
 
 def _extract_pom_properties(content: str) -> dict:  # 从 pom 的 properties 块中提取键值对。

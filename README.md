@@ -1,25 +1,53 @@
 # Rerun Test Tool
 
-这是一个面向 flaky test / NIO test 研究数据的重跑工具。它会从 `patch-data/` 读取样本，自动完成以下流程：
+这是一个面向 Java flaky test 研究与实验的重跑工具。当前版本支持两类工作流：
 
-1. 根据 `repo_url` 和 `original_sha` 克隆并切换到目标仓库版本。
-2. 定位目标测试文件与测试方法，并将 `generated_patch` 应用到对应测试中。
-3. 根据项目的 Java 版本、模块信息和本地构建环境，自动决定使用本地还是 Docker 进行编译。
-4. 多次重跑目标测试，输出稳定性结果到 `results/*.csv`。
+1. `verify-patch`
+   将 `generated_patch` 应用到目标测试，再构建并多次重跑，用来验证补丁是否消除不稳定性。
+2. `detect-flaky`
+   完全不改源码，直接把原始 flaky test 作为输入，多次重跑观察其稳定性；可选使用 `NonDex` 作为执行后端。
 
-当前版本重点增强了两类稳定性能力：
+相比旧版本，现在的核心变化是：
 
-- 环境稳定性：优先按模块检测 Java 版本；`--docker auto` 会结合实际构建工具所使用的 JDK 做判断，减少“本地 JDK 看起来能用、实际编译失败”的误判。
-- 补丁稳定性：补丁应用不再只做简单文本替换，而是结合文件候选打分、方法定位和原始 `flaky_code` 相似度校验，降低误贴到错误方法的概率。
+- 输入模型不再被“必须有补丁”绑死。
+- 执行方式不再只有一种普通 rerun，而是支持 `standard` 与 `nondex` 两类后端。
+- CLI 被改成“按工作流组织”，同时保留旧命令兼容入口。
+
+## 架构概览
+
+```mermaid
+flowchart LR
+  CLI[CLIAndSubcommands] --> Inputs[InputLoaders]
+  Inputs --> Request[RunRequest]
+  Request --> Workflow[WorkflowOrchestrator]
+  Workflow --> Prepare[WorkspacePreparer]
+  Workflow --> Build[BuildAndValidate]
+  Workflow --> Exec[TestExecutionStrategy]
+  Exec --> Results[ResultsWriter]
+```
+
+这套拆分的好处是：
+
+- `verify-patch` 和 `detect-flaky` 可以共用克隆、构建、结果输出逻辑。
+- `standard` 和 `nondex` 可以作为执行策略独立演进，而不是把条件分支堆在一个函数里。
+- 后续如果要新增别的 runner 或别的 workspace preparation 方式，改动范围会更小。
+
+代价是模块数比以前更多，理解入口时需要先接受“请求对象 + 工作流 + 执行策略”这三个层次。
 
 ## 目录说明
 
-- `rerun_tool/`：工具核心实现。
-- `patch-data/`：输入数据集，至少包含 `repo_url`、`original_sha`、`module`、`full_test_name`、`generated_patch` 等字段。
-- `reference-paper/`：论文材料。
-- `workspace/`：运行时克隆下来的目标仓库。
-- `results/`：输出结果目录。
-- `tests/`：本仓库自己的 Python 单元测试。
+- `rerun_tool/`
+  核心实现，包含输入解析、工作流编排、补丁应用、执行后端和结果写出。
+- `patch-data/`
+  现有补丁验证数据集。
+- `reference-paper/`
+  论文材料。
+- `workspace/`
+  运行时克隆下来的目标仓库。
+- `results/`
+  结果输出目录。
+- `tests/`
+  本工具自己的 Python 单元测试。
 
 ## 运行前准备
 
@@ -28,15 +56,12 @@
 - Python `3.10+`
 - Git
 - Docker
-- 本地 Maven 或 Gradle：可选，但建议安装，因为 `--docker auto` 在部分项目上会读取构建工具版本信息来判断兼容性
+- 本地 Maven 或 Gradle
+  权衡：不是绝对必须，但建议安装，因为 `--docker auto` 在部分项目上会读取构建工具版本信息来辅助判断兼容性。
 
-本项目当前没有额外的 Python 三方依赖，默认使用 Python 标准库即可运行。
+本项目当前不依赖额外 Python 三方库，默认使用标准库即可运行。
 
-## 快速开始
-
-如果你只想先确认工具能跑，建议按下面顺序操作。
-
-### 1. 检查基础环境
+先检查环境：
 
 ```bash
 python3 --version  # 检查 Python 版本
@@ -45,252 +70,556 @@ docker info  # 检查 Docker 守护进程是否已启动
 mvn -version  # 可选：检查 Maven 及其实际使用的 JDK
 ```
 
-如果 `docker info` 失败，说明 Docker 还没有启动；此时你仍然可以用 `--docker never` 走本地模式，但跨项目稳定性会明显下降。
+如果 `docker info` 失败，你仍然可以使用 `--docker never` 走本地模式。
+权衡：启动更快、手工调试更直接；但跨项目兼容性会下降，尤其是旧 Java 项目。
 
-### 2. 运行本仓库单元测试
+## 快速开始
 
-```bash
-python3 -m unittest discover -s tests -v  # 运行本工具自带的单元测试
-```
-
-如果这一步失败，先不要跑数据集，优先修复本工具自身环境问题。
-
-### 3. 先跑一个小样本
+### 1. 运行本仓库单元测试
 
 ```bash
-python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --rows 1 --rerun 1 --docker auto -o results/quick_start.csv  # 只跑第 1 条样本做冒烟测试
+python3 -m unittest discover -s tests -v  # 先验证工具本身没有坏
 ```
 
-这条命令适合首次验证，优点是快、定位问题简单；缺点是覆盖面有限，不能代表批量运行表现。
-
-### 4. 再跑一批样本
+### 2. 旧版兼容入口：补丁验证
 
 ```bash
-python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 10 --rerun 5 --docker auto -o results/batch_run.csv  # 跑前 10 条样本并对每条测试重跑 5 次
+python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --rows 1 --rerun 1 --docker auto -o results/legacy_smoke.csv  # 旧命令仍然可用，默认等价于 verify-patch
 ```
 
-这条命令更接近真实评估，优点是可以观察构建与重跑稳定性；缺点是耗时更长，也更依赖 Docker 缓存和网络状况。
-
-## 使用方法
-
-基础命令形式如下：
+### 3. 新版显式入口：补丁验证
 
 ```bash
-python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 5 --rerun 10 --docker auto  # 使用 CSV 数据集运行前 5 条样本并对每条重跑 10 次
+python3 -m rerun_tool verify-patch --csv patch-data/cleaned_mutation_data.csv --rows 1 --rerun 1 --docker auto -o results/verify_patch_smoke.csv  # 使用新子命令做补丁验证
 ```
 
-常见参数如下。
+### 4. 新版显式入口：patchless flaky 检测
 
-### 输入与输出
+```bash
+python3 -m rerun_tool detect-flaky --repo-url https://github.com/SAP/emobility-smart-charging --sha 53c97ae60625a3e89a130213551840e455b74ae6 --full-test-name com.sap.charging.model.FuseTreeTest.testToJSON.testToJSON --module . --rerun 3 --docker auto -o results/detect_flaky_smoke.csv  # 单条 CLI 输入做 patchless 检测
+```
 
-- `--csv`：输入数据集路径。
-- `--output` 或 `-o`：结果文件路径；不传时自动写入 `results/rerun_results_<timestamp>.csv`。
-- `--workspace` 或 `-w`：目标仓库克隆目录，默认是 `workspace/`。
+## 工作流说明
 
-### 样本筛选
+### `verify-patch`
 
-- `--rows 0,1,2`：按行号精确选择样本。
-  权衡：最适合复现单个问题，定位最精确；但不适合批量评估。
-- `--limit 10`：只处理前 `10` 条样本。
-  权衡：适合冒烟测试和小规模批量试跑；但如果数据集顺序本身有偏差，代表性有限。
-- `--project commons-lang`：只处理项目名中包含给定字符串的样本。
-  权衡：适合分项目调试环境；但如果同项目模块多，仍然可能需要结合 `--rows` 细化定位。
+适用场景：
 
-### 重跑模式
+- 你已经有 `generated_patch`
+- 你关心“补丁是否消除了 flakiness”
 
-- `--rerun`：单个测试重复执行次数，默认 `10`。
-  权衡：次数越多，越容易观察 flakiness；但耗时线性增加。
-- `--mode isolated`：每次测试独立 JVM，默认值。
-  权衡：隔离性最好，适合大多数 flaky test；但单次运行开销更大。
-- `--mode same_jvm`：复用 JVM，主要用于 NIO 风格测试。
-  权衡：更容易复现同环境状态污染；但对非 NIO 场景可能引入额外噪声。
+流程如下：
 
-### Docker 模式
+1. 克隆仓库并检出 `original_sha`
+2. 定位测试文件
+3. 应用补丁
+4. 构建
+5. 如果是补丁模式且首次构建失败，尝试做保守的 import 自动修复
+6. 多次重跑测试
 
-- `--docker auto`：默认模式。工具会结合项目声明的 Java 版本和本地构建工具实际使用的 JDK 自动决定是否启用 Docker。
+优点：
+
+- 可以直接回答“补丁后是否稳定”
+- 会自动处理一部分常见 import 缺失问题
+
+缺点：
+
+- 会修改工作区源码
+- 如果补丁本身质量差，失败可能来自补丁而不是测试本身
+
+### `detect-flaky`
+
+适用场景：
+
+- 你没有补丁
+- 你只想检测原始测试是否不稳定
+
+流程如下：
+
+1. 克隆仓库并检出 `original_sha`
+2. 定位测试文件
+3. 不改源码
+4. 构建
+5. 多次重跑测试
+
+优点：
+
+- 语义干净，完全不污染原始源码
+- 既适合单条 CLI 调试，也适合批量 CSV 扫描
+
+缺点：
+
+- 不能自动修复补丁相关的编译问题，因为本模式本来就不应该改源码
+- 只能观测 flaky 行为，不能回答“补丁是否修好”
+
+## 执行后端
+
+### `--runner standard`
+
+这是默认后端，直接使用普通 Maven Surefire 或 Gradle test 进行多次重跑。
+
+优点：
+
+- 兼容性最好
+- 支持 Maven 和 Gradle
+- 与旧版行为最接近
+
+缺点：
+
+- 对某些顺序依赖或迭代顺序敏感问题，暴露能力有限
+
+### `--runner nondex`
+
+这是可选后端，当前仅支持 Maven，通过 `edu.illinois:nondex-maven-plugin:2.1.7:nondex` 执行。
+
+优点：
+
+- 对顺序相关 flaky 更敏感
+- 更适合做 patchless flaky detection 的增强复现
+
+缺点：
+
+- 当前只支持 Maven 项目
+- 比 `standard` 更慢
+- 目前只支持 `--mode isolated`
+
+示例：
+
+```bash
+python3 -m rerun_tool detect-flaky --repo-url https://github.com/SAP/emobility-smart-charging --sha 53c97ae60625a3e89a130213551840e455b74ae6 --full-test-name com.sap.charging.model.FuseTreeTest.testToJSON.testToJSON --module . --runner nondex --rerun 3 --docker auto -o results/detect_flaky_nondex.csv  # 使用 NonDex 做 patchless 检测
+```
+
+## 输入方式
+
+### 1. 补丁验证 CSV
+
+`verify-patch` 使用现有补丁数据集，至少需要这些字段：
+
+- `repo_url`
+- `original_sha`
+- `module`
+- `full_test_name`
+- `generated_patch`
+
+旧接口与新接口都支持它：
+
+```bash
+python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 5 --rerun 3 --docker auto -o results/legacy_batch.csv  # 旧版兼容形式
+python3 -m rerun_tool verify-patch --csv patch-data/cleaned_mutation_data.csv --limit 5 --rerun 3 --docker auto -o results/verify_patch_batch.csv  # 新版显式形式
+```
+
+### 2. patchless flaky CSV
+
+`detect-flaky` 支持更简化的 CSV，至少需要：
+
+- `repo_url`
+- `original_sha`
+- `module`
+- `full_test_name`
+
+最小示例：
+
+```csv
+repo_url,original_sha,module,full_test_name
+https://github.com/SAP/emobility-smart-charging,53c97ae60625a3e89a130213551840e455b74ae6,.,com.sap.charging.model.FuseTreeTest.testToJSON.testToJSON
+```
+
+运行方式：
+
+```bash
+python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --rerun 5 --docker auto -o results/flaky_batch.csv  # 批量读取 patchless flaky CSV
+```
+
+### 3. 单条 CLI 输入
+
+如果你只想快速调试一个测试，不需要先写 CSV：
+
+```bash
+python3 -m rerun_tool detect-flaky --repo-url https://github.com/SAP/emobility-smart-charging --sha 53c97ae60625a3e89a130213551840e455b74ae6 --full-test-name com.sap.charging.model.FuseTreeTest.testToJSON.testToJSON --module . --rerun 5 --docker auto -o results/flaky_single.csv  # 单条 CLI 输入做 patchless 检测
+```
+
+权衡：
+
+- 单条 CLI 最快，最适合调试
+- CSV 最适合批量实验
+
+## 常用参数
+
+### 选择样本
+
+- `--rows 0,1,2`
+  权衡：最适合复现单个或少量问题；但不适合大批量实验。
+- `--limit 10`
+  权衡：适合冒烟测试和小批量试跑；但如果数据集顺序本身有偏差，代表性有限。
+- `--project commons-lang`
+  权衡：适合按项目分组排查环境问题；但 patchless 单条 CLI 模式通常不需要它。
+
+### 重跑相关
+
+- `--rerun`
+  权衡：次数越大，越容易观察 flakiness；但耗时线性增加。
+- `--mode isolated`
+  权衡：隔离性最好，也是 `nondex` 当前唯一支持的模式；但单次开销更大。
+- `--mode same_jvm`
+  权衡：更适合模拟状态污染；但当前只适用于 `--runner standard`。
+
+### 执行环境
+
+- `--docker auto`
   权衡：通用性最好，推荐默认使用；但第一次拉镜像会比较慢。
-- `--docker always`：始终使用 Docker。
-  权衡：跨机器复现最稳定，适合做正式实验；但性能通常比本地直接执行略慢，首次准备时间更长。
-- `--docker never`：始终使用本地环境。
-  权衡：速度可能更快，也便于手工调试；但最依赖本机 JDK/Maven/Gradle 版本匹配，跨项目失败率最高。
+- `--docker always`
+  权衡：跨机器复现最稳定；但首次准备时间更长。
+- `--docker never`
+  权衡：本地调试最方便；但对 JDK/Maven/Gradle 版本更敏感。
 
-### 超时与重试
+### 恢复执行
 
-- `--build-timeout`：构建超时，默认 `600` 秒。
-- `--test-timeout`：单次测试超时，默认 `300` 秒。
-- `--build-retries`：可恢复构建错误的重试次数，默认 `2`。
+- `--resume`
+  权衡：适合长时间批量实验中断后继续跑；但如果你想重新复测同一个输出文件里的已完成条目，就不要开它。
 
-如果你在网络较差或首次拉依赖时运行，建议适当提高 `--build-timeout`。
-
-### 日志
-
-- `--verbose`：输出更详细的调试日志。
-- `--log-file`：将日志额外写入文件。
-
-推荐在批量跑实验时总是保存日志，例如：
+示例：
 
 ```bash
-python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 20 --rerun 3 --docker auto --verbose --log-file results/batch_debug.log -o results/batch_debug.csv  # 批量运行并将详细日志保存到文件
+python3 -m rerun_tool verify-patch --csv patch-data/cleaned_mutation_data.csv --limit 20 --rerun 3 --docker auto -o results/verify_patch_batch.csv --resume  # 从已有结果文件中恢复 verify-patch 批任务
+python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --runner nondex --rerun 3 --docker auto -o results/flaky_nondex_batch.csv --resume  # 从已有结果文件中恢复 patchless NonDex 批任务
 ```
 
 ## 输出结果说明
 
-结果会写入一个 CSV 文件，常见字段包括：
+结果会写入 CSV。当前版本的设计原则是：
 
-- `status`：主流程状态，例如 `completed`、`build_failed`、`patch_failed`、`clone_failed`。
-- `rerun_results`：每次重跑的结果数组。
-- `pass_count` / `fail_count` / `error_count`：通过、失败、错误次数统计。
-- `verdict`：综合结论，例如 `STABLE_PASS`、`STABLE_FAIL`、`FLAKY`、`BUILD_ERROR`、`SETUP_ERROR`、`RUN_ERROR`。
+- 保留 `rerun_results` 这一列里的 JSON 数组，例如 `["pass", "pass", "fail"]`
+- 不再把每一轮结果展开成 `run_1`、`run_2`、`run_3` 这种超长列
+- 额外补充总耗时、纯 rerun 耗时，以及关键阶段 checkpoint 的阶段 verdict 和耗时
 
-最常见的理解方式如下：
+这样做的好处是：
 
-- `STABLE_PASS`：补丁应用后，多次重跑都通过。
-- `FLAKY`：同一样本在多次重跑中既有 `pass` 又有 `fail`。
-- `BUILD_ERROR`：项目或补丁无法编译。
-- `SETUP_ERROR`：仓库克隆、测试文件定位或补丁应用阶段失败。
+- 结果表宽度可控，批量实验时不会因为 `rerun=50` 或 `rerun=100` 变得非常难读
+- 原始逐轮结果仍然完整保留在 `rerun_results` 中，后续做自定义统计也不会丢信息
+- 关键阶段信息被显式结构化，便于直接筛选“前 10 次已经 flaky”或“前 20 次仍稳定”的样本
+
+代价是：
+
+- 如果你想直接在 Excel 里按单轮次做透视，就需要先把 `rerun_results` 这一列展开
+- 阶段列只保留关键 checkpoint，而不是每一轮的明细列
+
+除了旧版字段，现在还会显式写出工作流语义与耗时信息：
+
+- `request_key`
+  稳定请求键，用于 `--resume`
+- `workflow`
+  当前工作流，取值如 `verify_patch`、`detect_flaky`
+- `runner_backend`
+  当前执行后端，取值如 `standard`、`nondex`
+- `input_source`
+  输入来源，取值如 `patch_csv`、`flaky_csv`、`cli`
+- `patch_mode`
+  当前是否带补丁，取值如 `with_patch`、`no_patch`
+- `status`
+  主流程状态，例如 `completed`、`build_failed`、`patch_failed`、`unsupported_runner`
+- `rerun_results`
+  每次重跑的结果数组，格式类似 `["pass", "fail", "pass"]`
+- `pass_count` / `fail_count` / `error_count`
+  统计信息
+- `total_elapsed_seconds`
+  从开始处理该条样本到结束的总耗时，包含克隆、依赖下载、构建、补丁应用和 rerun
+- `rerun_elapsed_seconds`
+  纯 rerun 阶段的总耗时，不包含克隆、下载和构建
+- `checkpoint_<N>_verdict`
+  前 `N` 次 rerun 的阶段性 verdict
+- `checkpoint_<N>_total_elapsed_seconds`
+  从该条样本开始处理到完成第 `N` 次 rerun 的总耗时
+- `checkpoint_<N>_rerun_elapsed_seconds`
+  从开始 rerun 到完成第 `N` 次 rerun 的纯 rerun 耗时
+- `verdict`
+  综合结论
+
+### checkpoint 列如何生成
+
+规则如下：
+
+- 如果 `--rerun` 小于等于 `10`，只保留最终阶段
+- 如果 `--rerun` 大于 `10`，默认保留每 `10` 次一个 checkpoint，再加最终阶段
+
+示例：
+
+- `--rerun 5`
+  会生成 `checkpoint_5_*`
+- `--rerun 15`
+  会生成 `checkpoint_10_*` 和 `checkpoint_15_*`
+- `--rerun 50`
+  会生成 `checkpoint_10_*`、`checkpoint_20_*`、`checkpoint_30_*`、`checkpoint_40_*`、`checkpoint_50_*`
+
+### 如何理解 checkpoint verdict
+
+`checkpoint_10_verdict` 的意思不是“第 10 次运行是否通过”，而是“前 10 次整体看下来是什么结论”。
+
+例如：
+
+- 前 10 次全是 `pass`
+  则 `checkpoint_10_verdict = STABLE_PASS`
+- 前 10 次既有 `pass` 又有 `fail`
+  则 `checkpoint_10_verdict = FLAKY`
+- 前 10 次全是 `fail`
+  则 `checkpoint_10_verdict = STABLE_FAIL`
+- 前 10 次全是 `error`
+  则 `checkpoint_10_verdict = RUN_ERROR`
+
+### 一行结果示意
+
+下面是一个经过压缩后的结果行示意：
+
+```csv
+request_key,status,rerun_results,total_elapsed_seconds,rerun_elapsed_seconds,checkpoint_10_verdict,checkpoint_10_total_elapsed_seconds,checkpoint_10_rerun_elapsed_seconds,checkpoint_20_verdict,checkpoint_20_total_elapsed_seconds,checkpoint_20_rerun_elapsed_seconds,verdict
+detect_flaky|standard|demo|...,completed,"[""pass"",""pass"",""pass"",""fail""]",38.421,11.204,STABLE_PASS,31.552,4.335,FLAKY,38.421,11.204,FLAKY
+```
+
+这里可以直接看出：
+
+- 前 10 次还是稳定通过
+- 跑到前 20 次后才暴露 flaky
+- 总耗时和纯 rerun 耗时是分开的
+
+### 如何理解 `verdict`
+
+- 在 `verify_patch` 中：
+  - `STABLE_PASS` 表示补丁后多次重跑都通过
+  - `FLAKY` 表示补丁后仍然有不稳定性
+- 在 `detect_flaky` 中：
+  - `FLAKY` 表示原始测试在当前 runner 下表现不稳定
+  - `STABLE_PASS` 表示原始测试在当前配置下稳定通过
+  - `STABLE_FAIL` 表示原始测试稳定失败
+
+也就是说，同一个 `verdict` 在不同 `workflow` 下语义不同，解读时一定要结合 `workflow` 一起看。
 
 ## 推荐使用姿势
 
-如果你是在做研究实验，我建议按下面的顺序推进：
+### 场景 A：你已经有补丁，想验证修复效果
 
-1. 先用 `--rows` 复现单个样本，确保目标项目能正确克隆、打补丁和编译。
-2. 再对单个项目使用 `--project` 做小批量运行，观察该项目在本机上的 Docker/JDK 行为是否稳定。
-3. 最后再扩大到整个数据集。
+```bash
+python3 -m rerun_tool verify-patch --csv patch-data/cleaned_mutation_data.csv --rows 1 --rerun 5 --docker auto -o results/verify_patch_one.csv  # 先复现单条补丁验证样本
+python3 -m rerun_tool verify-patch --csv patch-data/cleaned_mutation_data.csv --project fastjson --limit 10 --rerun 5 --docker auto -o results/verify_patch_fastjson.csv  # 再按项目做小批量补丁验证
+```
 
-这种顺序的优点是问题定位最清晰；缺点是前期步骤更细，不如直接全量跑省事。但对于跨项目 flaky test 工具，先验证稳定性通常更划算。
+### 场景 B：你没有补丁，只想找 flaky
+
+```bash
+python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --rerun 5 --runner standard --docker auto -o results/flaky_standard.csv  # 先用标准后端做基线检测
+python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --rerun 5 --runner nondex --docker auto -o results/flaky_nondex.csv  # 再用 NonDex 提高顺序相关问题暴露概率
+```
+
+权衡：
+
+- `standard` 适合做兼容性更强的第一轮扫描
+- `nondex` 适合做更激进的第二轮确认
+
+## 实战教程
+
+### 教程 1：先用一条样本验证整条链路
+
+适用场景：
+
+- 你刚改完代码
+- 你想先确认 clone、build、rerun、结果写出都没坏
+
+```bash
+python3 -m rerun_tool verify-patch --csv patch-data/cleaned_mutation_data.csv --rows 1 --rerun 3 --docker auto -o results/tutorial_verify_patch_one.csv  # 用一条补丁样本做最小端到端检查
+```
+
+权衡：
+
+- 最省时间，适合先冒烟
+- 代表性有限，不能说明批量数据一定都稳定
+
+### 教程 2：批量补丁验证并支持中断恢复
+
+适用场景：
+
+- 你已经有一批 `generated_patch`
+- 你担心中途网络或构建失败导致任务中断
+
+```bash
+python3 -m rerun_tool verify-patch --csv patch-data/incorrect_patch.csv --limit 20 --rerun 20 --docker auto -o results/tutorial_verify_patch_batch.csv --resume  # 批量补丁验证并允许断点续跑
+```
+
+权衡：
+
+- 最适合长任务和大批量实验
+- 如果你本来就是想从头重跑全部样本，就不要加 `--resume`
+
+### 教程 3：不写 CSV，直接调单个 flaky test
+
+适用场景：
+
+- 你只想看某一个测试
+- 你不想先手工整理 CSV
+
+```bash
+python3 -m rerun_tool detect-flaky --repo-url https://github.com/SAP/emobility-smart-charging --sha 53c97ae60625a3e89a130213551840e455b74ae6 --full-test-name com.sap.charging.model.FuseTreeTest.testToJSON.testToJSON --module . --rerun 20 --runner standard --docker auto -o results/tutorial_single_flaky.csv  # 直接对单条 flaky test 做 patchless 检测
+```
+
+权衡：
+
+- 输入最快，最适合调试
+- 不适合成规模批处理
+
+### 教程 4：先用 standard 扫描，再用 NonDex 复核
+
+适用场景：
+
+- 你希望先要兼容性，再要更强的暴露能力
+- 你怀疑存在顺序依赖类 flaky
+
+```bash
+python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --rerun 20 --runner standard --docker auto -o results/tutorial_flaky_standard.csv  # 第一步先用 standard 做基线扫描
+python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --rerun 20 --runner nondex --docker auto -o results/tutorial_flaky_nondex.csv  # 第二步再用 NonDex 做增强复核
+```
+
+权衡：
+
+- `standard` 更稳，适合作为第一轮
+- `nondex` 更激进，但更慢，而且当前只支持 Maven
+
+### 教程 5：当你关心 50 次 rerun 的阶段性变化
+
+适用场景：
+
+- 你需要更高置信度的 flaky 观测
+- 你不只关心最终 verdict，还关心“第几阶段开始暴露问题”
+
+```bash
+python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --rerun 50 --runner standard --docker auto -o results/tutorial_rerun50.csv  # 运行 50 次并输出 10/20/30/40/50 阶段统计
+```
+
+跑完后可以重点看这些列：
+
+- `checkpoint_10_verdict`
+- `checkpoint_20_verdict`
+- `checkpoint_30_verdict`
+- `checkpoint_40_verdict`
+- `checkpoint_50_verdict`
+
+以及对应的：
+
+- `checkpoint_10_total_elapsed_seconds` / `checkpoint_10_rerun_elapsed_seconds`
+- `checkpoint_20_total_elapsed_seconds` / `checkpoint_20_rerun_elapsed_seconds`
+- `checkpoint_30_total_elapsed_seconds` / `checkpoint_30_rerun_elapsed_seconds`
+- `checkpoint_40_total_elapsed_seconds` / `checkpoint_40_rerun_elapsed_seconds`
+- `checkpoint_50_total_elapsed_seconds` / `checkpoint_50_rerun_elapsed_seconds`
+
+权衡：
+
+- 可以更细地观察 flaky 暴露过程
+- 总耗时会显著高于 `--rerun 5` 或 `--rerun 10`
+
+### 教程 6：如何判断耗时主要花在构建还是 rerun
+
+适用场景：
+
+- 你想优化实验吞吐
+- 你发现某些项目特别慢，想判断慢在构建还是慢在测试执行
+
+看同一行里的两列即可：
+
+- `total_elapsed_seconds`
+- `rerun_elapsed_seconds`
+
+如果：
+
+- `total_elapsed_seconds` 远大于 `rerun_elapsed_seconds`
+  说明主要时间花在克隆、依赖下载、构建或补丁应用
+- 两者差距不大
+  说明主要时间花在真正的 rerun 阶段
+
+权衡：
+
+- 这种判断非常直观，适合先粗看瓶颈
+- 但它不能替代更细粒度的 profiler，只能做阶段级分析
 
 ## 配置到其他电脑
 
-下面是把这个工具迁移到另一台电脑的推荐方法。
+### 方案 A：Docker 优先
 
-### 方案 A：推荐方案，Docker 优先
+适用场景：
 
-适用场景：你希望最大化跨机器一致性，尤其是不同项目需要不同 JDK 时。
+- 你希望最大化跨机器一致性
+- 你要跑批量实验
 
 优点：
 
-- 复现性最好。
-- 对本地 JDK 依赖较小。
-- 更适合批量实验和长时间运行。
+- 复现性最好
+- 对本地 JDK 依赖较小
 
 缺点：
 
-- 第一次拉镜像和依赖会比较慢。
-- 需要保证 Docker 本身可用，且磁盘空间足够。
-
-迁移步骤如下：
-
-1. 安装 Python、Git 和 Docker。
-2. 把本仓库完整拷贝到新电脑，或者重新克隆。
-3. 确保 `patch-data/` 也同步过去。
-4. 运行单元测试。
-5. 先跑一个小样本。
-
-示例命令如下：
+- 第一次拉镜像和依赖会比较慢
+- 需要保证 Docker 可用，且磁盘空间足够
 
 ```bash
 git clone <你的仓库地址> rerun-test  # 克隆本工具仓库到新电脑
 cd rerun-test  # 进入项目根目录
-python3 -m unittest discover -s tests -v  # 先验证工具本身没有坏
-python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --rows 1 --rerun 1 --docker auto -o results/migrate_check.csv  # 用单条样本验证新机器环境
+python3 -m unittest discover -s tests -v  # 先验证工具本身
+python3 -m rerun_tool verify-patch --csv patch-data/cleaned_mutation_data.csv --rows 1 --rerun 1 --docker auto -o results/migrate_verify_patch.csv  # 用补丁验证样本检查新机器
+python3 -m rerun_tool detect-flaky --repo-url https://github.com/SAP/emobility-smart-charging --sha 53c97ae60625a3e89a130213551840e455b74ae6 --full-test-name com.sap.charging.model.FuseTreeTest.testToJSON.testToJSON --module . --rerun 1 --docker auto -o results/migrate_detect_flaky.csv  # 用 patchless 单条检测检查新机器
 ```
 
 ### 方案 B：本地构建优先
 
-适用场景：你没有 Docker，或者希望直接在本机调试 Maven/Gradle/JDK 问题。
+适用场景：
+
+- 你没有 Docker
+- 你想直接在本机调试 Maven/Gradle/JDK 问题
 
 优点：
 
-- 启动更快。
-- 容易直接观察本机构建链问题。
-- 对图形化 Docker 环境没有依赖。
+- 启动更快
+- 更容易直接观察本机构建链问题
 
 缺点：
 
-- 对 JDK、Maven、Gradle 版本更敏感。
-- 对旧 Java 项目不够稳定。
-- 在不同电脑之间更容易出现“这台机器能跑，那台不能跑”的情况。
-
-如果你选择这一方案，建议至少保证：
-
-- 本机安装了 `mvn`。
-- 本机安装了 `java`。
-- 对需要旧版 Java 的项目，尽量准备多个 JDK 并手工切换。
-
-运行方式如下：
+- 对 JDK、Maven、Gradle 版本更敏感
+- 对旧 Java 项目不够稳定
 
 ```bash
-python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 5 --rerun 3 --docker never -o results/local_only.csv  # 强制使用本地环境运行
+python3 -m rerun_tool verify-patch --csv patch-data/cleaned_mutation_data.csv --limit 5 --rerun 3 --docker never -o results/local_verify_patch.csv  # 强制本地执行补丁验证
+python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --rerun 3 --runner standard --docker never -o results/local_detect_flaky.csv  # 强制本地执行 patchless 检测
 ```
 
-### Windows 电脑建议
+### Windows 建议
 
-如果你是在 Windows 上部署，优先建议使用 `WSL2 + Docker Desktop`。
+优先推荐 `WSL2 + Docker Desktop`。
 
-优点：
+权衡：
 
-- 与当前仓库的命令行习惯更接近。
-- Git、Docker、Python 的行为更接近 Linux/macOS。
-
-缺点：
-
-- 初次配置会比 macOS / Linux 更复杂。
-- 需要同时关注 Windows 与 WSL2 的磁盘和 Docker 资源设置。
-
-不推荐直接在纯 Windows `cmd` 环境下长期跑批量实验，因为 Git、路径和 Docker 行为更容易出现兼容性差异。
-
-## 迁移时建议一起带走的内容
-
-建议迁移以下目录：
-
-- `patch-data/`：必需，工具的输入数据集。
-- `reference-paper/`：可选，便于对照论文。
-- `tests/`：建议保留，用来验证新机器安装是否正确。
-- `results/`：可选，如果你希望保留历史实验结果。
-
-下面这些目录不一定需要拷贝：
-
-- `workspace/`
-  权衡：拷过去可以减少第一次重新克隆的时间；但它体积大，而且里面是运行时缓存，新机器上重新生成通常更干净。
+- 与当前命令行和路径习惯更接近
+- 比直接在纯 Windows `cmd` 下跑批量实验更稳定
 
 ## 常见问题
 
-### 1. 为什么 `--docker auto` 还是很慢
+### 1. 为什么 `detect-flaky` 不会自动修复 import
 
-常见原因有两个：
+因为它的目标是“观测原始测试是否 flaky”，不是“修改源码让它过”。
+权衡：这样语义最干净；代价是 patchless 模式不能像补丁验证那样帮你修补新增 import。
 
-- 第一次拉 Docker 镜像。
-- 第一次下载 Maven / Gradle 依赖。
+### 2. 为什么 `--runner nondex` 只支持 Maven
 
-这是正常现象。第二次运行通常会明显更快，因为工具会复用 Docker volume 缓存。
+当前 NonDex 集成是通过 Maven 插件触发的。我们选择先把 Maven 路径做稳，而不是对 Gradle 做不完整的模拟支持。
+权衡：能力边界更明确；代价是当前阶段 `nondex` 不能覆盖 Gradle 项目。
 
-### 2. 为什么我本地有 Java，工具还是选择 Docker
+### 3. 为什么旧命令还保留
 
-因为工具不是只看 `java -version`，而是尽量判断“实际构建时会用哪个 JDK”。如果项目声明的是 `1.5`、`1.6`、`1.7` 这类老版本，现代本地 JDK 往往并不真正兼容，所以工具会倾向于切到 Docker。
-
-### 3. 为什么补丁应用成功了，但编译还是失败
-
-这通常说明问题已经不在“环境层”，而在“补丁层”，例如：
-
-- `generated_patch` 新增了符号但没有补 import。
-- 目标测试方法虽然定位正确，但补丁本身并不完整。
-- 上下文依赖没有一起修改。
-
-也就是说，`patch_applied` 不等于 `build_passed`，这两步需要分开看。
-
-### 4. 什么时候应该用 `--docker always`
-
-如果你在做正式实验、跑整批数据，或者需要迁移到另一台电脑复现，优先推荐 `--docker always` 或 `--docker auto`。只有当你明确知道本地构建链和目标项目完全兼容时，才建议长期使用 `--docker never`。
-
-## 一套推荐命令
-
-如果你想在新机器上从零开始，下面是一套最稳妥的顺序：
+因为已有批处理脚本和实验流程可能都在用旧接口：
 
 ```bash
-python3 -m unittest discover -s tests -v  # 先跑单元测试确认工具本身正常
-python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --rows 1 --rerun 1 --docker auto -o results/smoke.csv  # 再跑单样本做冒烟验证
-python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --project fastjson --limit 5 --rerun 3 --docker auto -o results/project_fastjson.csv  # 然后按项目做小批量验证
-python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 50 --rerun 5 --docker auto -o results/full_batch.csv  # 最后再扩大到更大的批量
+python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 5 --rerun 3 --docker auto -o results/legacy.csv  # 旧命令仍然兼容
 ```
 
-这套流程的优点是稳、便于定位问题；缺点是前几步比直接全量运行更花时间。但如果目标是让工具在另一台电脑上可靠落地，这种顺序最省总时间。
+权衡：向后兼容最好；代价是 README 和 CLI 里需要同时解释“新子命令”和“旧兼容入口”。
+
+### 4. 什么时候应该优先用 `detect-flaky`
+
+当你没有补丁、或者你想把“测试本身是否 flaky”和“补丁是否修好”这两个问题分开时，优先用 `detect-flaky`。
+
+### 5. 什么时候应该优先用 `verify-patch`
+
+当你已经有 `generated_patch`，并且真正关心的是“应用补丁后是否稳定通过”，优先用 `verify-patch`。

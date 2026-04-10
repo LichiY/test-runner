@@ -3,3 +3,8 @@
 
 # 忽略本地工作区源码目录，避免上传嵌套仓库或大体积源码
 workspace/
+FlakyDoctor/
+
+# 忽略 Python 运行时自动生成的缓存文件
+__pycache__/
+*.pyc
