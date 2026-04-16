@@ -57,9 +57,9 @@ class ResultsBehaviorTests(unittest.TestCase):  # 测试历史结果恢复逻辑
         with tempfile.TemporaryDirectory() as tmp_dir:  # 创建隔离的临时目录。 
             output_path = Path(tmp_dir) / 'results.csv'  # 构造结果文件路径。 
             with output_path.open('w', newline='', encoding='utf-8') as f:  # 用 CSV 写入器稳定生成结果文件。 
-                writer = csv.DictWriter(f, fieldnames=['request_key', 'index', 'workflow', 'runner_backend', 'input_source', 'patch_mode', 'repo_url', 'project_name', 'module', 'test_class', 'test_method', 'full_test_name', 'original_sha', 'pr_link', 'is_correct_label', 'status', 'rerun_results', 'pass_count', 'fail_count', 'error_count', 'total_runs', 'total_elapsed_seconds', 'rerun_elapsed_seconds', 'verdict', 'error_message', 'checkpoint_1_verdict', 'checkpoint_1_total_elapsed_seconds', 'checkpoint_1_rerun_elapsed_seconds'])  # 定义与新结果文件一致的表头字段。 
+                writer = csv.DictWriter(f, fieldnames=['request_key', 'index', 'workflow', 'runner_backend', 'input_source', 'patch_mode', 'repo_url', 'project_name', 'module', 'test_class', 'test_method', 'full_test_name', 'original_sha', 'pr_link', 'is_correct_label', 'original_rerun_consistency', 'status', 'rerun_results', 'pass_count', 'fail_count', 'error_count', 'total_runs', 'total_elapsed_seconds', 'rerun_elapsed_seconds', 'verdict', 'error_message', 'checkpoint_1_verdict', 'checkpoint_1_total_elapsed_seconds', 'checkpoint_1_rerun_elapsed_seconds'])  # 定义与新结果文件一致的表头字段。 
                 writer.writeheader()  # 先写入表头。 
-                writer.writerow({'request_key': request.request_key, 'index': 7, 'workflow': 'detect_flaky', 'runner_backend': 'nondex', 'input_source': 'cli', 'patch_mode': 'no_patch', 'repo_url': 'https://example.com/repo.git', 'project_name': 'demo', 'module': '.', 'test_class': 'com.example.ExampleTest', 'test_method': 'test7', 'full_test_name': 'com.example.ExampleTest.test7', 'original_sha': 'a' * 40, 'pr_link': '', 'is_correct_label': '', 'status': 'completed', 'rerun_results': rerun_results_json, 'pass_count': 1, 'fail_count': 0, 'error_count': 0, 'total_runs': 1, 'total_elapsed_seconds': '3.500', 'rerun_elapsed_seconds': '1.250', 'verdict': 'STABLE_PASS', 'error_message': '', 'checkpoint_1_verdict': 'STABLE_PASS', 'checkpoint_1_total_elapsed_seconds': '3.500', 'checkpoint_1_rerun_elapsed_seconds': '1.250'})  # 写入一条带 request_key 与耗时字段的历史结果。 
+                writer.writerow({'request_key': request.request_key, 'index': 7, 'workflow': 'detect_flaky', 'runner_backend': 'nondex', 'input_source': 'cli', 'patch_mode': 'no_patch', 'repo_url': 'https://example.com/repo.git', 'project_name': 'demo', 'module': '.', 'test_class': 'com.example.ExampleTest', 'test_method': 'test7', 'full_test_name': 'com.example.ExampleTest.test7', 'original_sha': 'a' * 40, 'pr_link': '', 'is_correct_label': '', 'original_rerun_consistency': '', 'status': 'completed', 'rerun_results': rerun_results_json, 'pass_count': 1, 'fail_count': 0, 'error_count': 0, 'total_runs': 1, 'total_elapsed_seconds': '3.500', 'rerun_elapsed_seconds': '1.250', 'verdict': 'STABLE_PASS', 'error_message': '', 'checkpoint_1_verdict': 'STABLE_PASS', 'checkpoint_1_total_elapsed_seconds': '3.500', 'checkpoint_1_rerun_elapsed_seconds': '1.250'})  # 写入一条带 request_key 与耗时字段的历史结果。 
             restored = load_results_csv(str(output_path), {request.request_key: request})  # 按 request_key 执行历史结果恢复。 
         self.assertEqual(len(restored), 1)  # 断言成功恢复出一条历史结果。 
         self.assertEqual(restored[0].entry.request_key, request.request_key)  # 断言恢复条目与 request_key 精确匹配。 
@@ -84,6 +84,28 @@ class ResultsBehaviorTests(unittest.TestCase):  # 测试历史结果恢复逻辑
         self.assertEqual(row['checkpoint_20_verdict'], 'FLAKY')  # 断言前 20 次阶段 verdict 会被正确汇总。 
         self.assertEqual(row['checkpoint_20_total_elapsed_seconds'], '18.000')  # 断言关键阶段总耗时会被写出。 
         self.assertEqual(row['checkpoint_20_rerun_elapsed_seconds'], '6.000')  # 断言关键阶段纯 rerun 耗时会被写出。 
+
+    def test_write_results_csv_preserves_error_tail_instead_of_front_truncation(self):  # 验证长错误信息写出时优先保留最后的失败点，而不是前部噪声。 
+        noisy_prefix = 'bootstrap\n' * 900  # 构造大量前部噪声，模拟框架初始化日志。 
+        important_tail = 'FINAL_FAILURE_MARKER\nTests run: 1, Failures: 1, Errors: 0\n'  # 构造必须保留下来的最终失败摘要。 
+        result = TestRunResult(entry=_make_request(9), status='completed', results=['error'], error_message=noisy_prefix + important_tail)  # 构造一条长 RUN_ERROR 结果。 
+        with tempfile.TemporaryDirectory() as tmp_dir:  # 创建隔离临时目录。 
+            output_path = Path(tmp_dir) / 'results.csv'  # 构造结果文件路径。 
+            write_results_csv([result], str(output_path), rerun_count=1)  # 将结果写出到 CSV。 
+            with output_path.open('r', newline='', encoding='utf-8') as f:  # 重新读取写出的结果文件。 
+                row = next(csv.DictReader(f))  # 读取唯一一条结果。 
+        self.assertIn('FINAL_FAILURE_MARKER', row['error_message'])  # 断言最终失败标记仍然存在。 
+        self.assertTrue(row['error_message'].endswith('Tests run: 1, Failures: 1, Errors: 0'))  # 断言尾部摘要不会再被前部截断吞掉。 
+
+    def test_write_results_csv_includes_original_rerun_consistency(self):  # 验证结果文件会显式带出原始输入里的 rerun_consistency 字段。
+        result = TestRunResult(entry=_make_entry(11), status='build_failed', error_message='boom')  # 构造一个最小构建失败结果。
+        result.entry.rerun_consistency = 'INCONSISTENT'  # 手动写入原始输入里的 rerun_consistency。
+        with tempfile.TemporaryDirectory() as tmp_dir:  # 创建隔离的临时目录。
+            output_path = Path(tmp_dir) / 'results.csv'  # 构造结果文件路径。
+            write_results_csv([result], str(output_path), rerun_count=1)  # 将结果写出到 CSV。
+            with output_path.open('r', newline='', encoding='utf-8') as f:  # 重新读取写出的结果文件。
+                row = next(csv.DictReader(f))  # 读取唯一一条结果。
+        self.assertEqual(row['original_rerun_consistency'], 'INCONSISTENT')  # 断言原始 rerun_consistency 会被写出到结果 CSV。
 
     def test_print_summary_outputs_verdict_counts(self):  # 验证结果摘要会完整打印数量与 verdict 统计。 
         result = TestRunResult(entry=_make_request(1), status='completed', results=['pass', 'fail'])  # 构造一个会被判定为 FLAKY 的结果对象。 
