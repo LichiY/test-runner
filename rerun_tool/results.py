@@ -10,6 +10,7 @@ from typing import Dict, List, Tuple  # 导入类型注解工具。
 from .runner import TestRunResult  # 导入统一测试结果对象。 
 
 logger = logging.getLogger(__name__)  # 创建当前模块的日志记录器。 
+CSV_ERROR_MESSAGE_LIMIT = 4000  # 为结果 CSV 保留更完整的错误上下文，避免关键尾部再次被过度截断。 
 
 
 def write_results_csv(results: List[TestRunResult], output_path: str, rerun_count: int) -> str:  # 将结果对象列表写回结果 CSV。 
@@ -40,6 +41,7 @@ def write_results_csv(results: List[TestRunResult], output_path: str, rerun_coun
         'original_sha',  # 保存原始提交号。 
         'pr_link',  # 保存 PR 链接。 
         'is_correct_label',  # 保存标签字段。 
+        'original_rerun_consistency',  # 保存原始输入里的 rerun_consistency 字段。 
         'status',  # 保存流程状态。 
         'rerun_results',  # 仅保存 JSON 数组形式的逐轮结果，不再展开为 run_i 列。 
         'pass_count',  # 保存通过次数。 
@@ -81,6 +83,7 @@ def write_results_csv(results: List[TestRunResult], output_path: str, rerun_coun
                 'original_sha': getattr(r.entry, 'original_sha', ''),  # 写入原始提交号。 
                 'pr_link': getattr(r.entry, 'pr_link', ''),  # 写入 PR 链接。 
                 'is_correct_label': getattr(r.entry, 'is_correct', ''),  # 写入标签字段。 
+                'original_rerun_consistency': getattr(r.entry, 'original_rerun_consistency', ''),  # 写入原始输入中的 rerun consistency 字段。 
                 'status': r.status,  # 写入流程状态。 
                 'rerun_results': json.dumps(r.results),  # 仅保留 JSON 数组形式的逐轮结果。 
                 'pass_count': r.pass_count,  # 写入通过次数。 
@@ -90,7 +93,7 @@ def write_results_csv(results: List[TestRunResult], output_path: str, rerun_coun
                 'total_elapsed_seconds': _format_seconds(r.total_elapsed_seconds),  # 写入包含构建等阶段的总耗时。 
                 'rerun_elapsed_seconds': _format_seconds(r.rerun_elapsed_seconds),  # 写入纯 rerun 阶段耗时。 
                 'verdict': _compute_verdict(r),  # 写入综合 verdict。 
-                'error_message': r.error_message[:500] if r.error_message else '',  # 写入截断后的错误信息。 
+                'error_message': _compact_csv_error_message(r.error_message),  # 将更长的错误尾部写入结果文件时优先保留关键诊断片段。 
             }  # 完成结果行基础字段构造。 
             for checkpoint in checkpoint_targets:  # 逐个补全关键阶段的 verdict 与耗时。 
                 partial_results = r.results[:checkpoint]  # 截取当前关键阶段范围内的结果数组。 
@@ -145,6 +148,35 @@ def load_results_csv(output_path: str, entry_lookup: Dict[int, object]) -> List[
             ))  # 结束单条结果对象恢复。
             seen_keys.add(dedupe_key)  # 记录该请求键已被恢复。
     return restored_results  # 返回恢复出的历史结果列表。
+
+
+def _compact_csv_error_message(message: str, limit: int = CSV_ERROR_MESSAGE_LIMIT) -> str:  # 在结果落盘阶段尽量保留完整诊断，同时避免单格内容无限膨胀。
+    normalized_message = (message or '').strip()  # 先统一规整空值与首尾空白。
+    if len(normalized_message) <= limit:  # 常见错误信息直接完整写出。
+        return normalized_message  # 保留完整上下文，避免再次丢失关键尾部。
+    diagnostic_header, message_body = _split_csv_diagnostic_header_and_body(normalized_message)  # 先尝试分离前置诊断头和真正的构建输出主体。
+    if diagnostic_header:  # 只有存在前置诊断头时才走“头尾兼顾”的压缩策略。
+        available_suffix = limit - len(diagnostic_header) - 2  # 预留两个换行字符后再计算还能容纳多少尾部信息。
+        if available_suffix > 0:  # 当前限制足够同时容纳前缀与部分尾部。
+            return f"{diagnostic_header}\n\n{message_body[-available_suffix:]}" if message_body else diagnostic_header[:limit]  # 优先保留前置诊断头和最终错误尾部。
+    return normalized_message[-limit:]  # 其余场景默认保留尾部，因为错误根因通常出现在日志末尾。
+
+
+def _split_csv_diagnostic_header_and_body(message: str) -> Tuple[str, str]:  # 将结果 CSV 里的前置诊断头和真实错误主体拆开。
+    diagnostic_prefixes = ('Generated patch context history:', 'Reference patch context history:', 'Reference patch fallback history:', 'Automatic repair history:')  # 当前需要优先保留的诊断前缀集合。
+    parts = [part.strip() for part in (message or '').split('\n\n')]  # 按空行切分多个前置诊断块与后续日志主体。
+    diagnostic_parts = []  # 收集连续出现在最前面的诊断块。
+    body_start = 0  # 记录真正日志主体从哪一块开始。
+    for idx, part in enumerate(parts):  # 顺序扫描切分后的区块。
+        if part.startswith(diagnostic_prefixes):  # 只要还是诊断头就继续保留。
+            diagnostic_parts.append(part)  # 收集当前诊断头。
+            body_start = idx + 1  # 更新主体起点。
+            continue
+        break  # 一旦遇到普通日志，后续都视为主体。
+    if not diagnostic_parts:  # 没有诊断头时返回空前缀。
+        return '', message
+    message_body = '\n\n'.join(part for part in parts[body_start:] if part).strip()  # 重新拼接真正的错误主体。
+    return '\n\n'.join(diagnostic_parts), message_body  # 返回诊断头和主体。
 
 
 def _compute_verdict(result: TestRunResult) -> str:  # 基于完整结果对象计算综合 verdict。 

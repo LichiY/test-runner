@@ -279,14 +279,43 @@ def get_docker_image(repo_dir: str, build_tool: str = 'maven', module: str = '')
     else:
         image_map = JDK_IMAGE_MAP
         default = DEFAULT_IMAGE
+    overridden_version = _project_specific_java_override(repo_dir, build_tool, java_version)  # 对少数已验证的编译器边界项目应用更稳定的 JDK 覆盖。
+    effective_version = overridden_version or java_version  # 优先使用项目特定覆盖，否则沿用常规版本检测结果。
 
-    if java_version:
-        image = image_map.get(java_version, default)
-        logger.info(f"Java version {java_version} -> Docker image {image}")
+    if effective_version:
+        image = image_map.get(effective_version, default)
+        if overridden_version:  # 单独记录项目覆盖，避免误以为是普通版本探测结果。
+            logger.info(f"Java version {java_version or 'unknown'} overridden to {effective_version} -> Docker image {image}")
+        else:
+            logger.info(f"Java version {effective_version} -> Docker image {image}")
     else:
         image = default
         logger.info(f"Java version not detected, using default: {image}")
     return image
+
+
+def _project_specific_java_override(repo_dir: str, build_tool: str, java_version: str) -> str:  # 为少数已验证存在编译器边界问题的项目返回更稳定的 JDK 版本。
+    if build_tool != 'maven':  # 当前覆盖仅针对 Maven 项目。
+        return ''  # Gradle 项目保持常规版本检测逻辑。
+    if java_version not in {'1.5', '1.6', '1.7', '1.8', '8'}:  # 只在旧源码级别项目里考虑编译器兼容性覆盖。
+        return ''  # 现代 Java 版本项目无需特殊处理。
+    root_pom = os.path.join(os.path.abspath(repo_dir), 'pom.xml')  # 仅基于仓库根 pom 做项目签名判断。
+    if not os.path.isfile(root_pom):  # 根 pom 不存在时无法安全识别项目。
+        return ''  # 保持默认镜像选择。
+    try:  # 根 pom 读取失败时直接回退到默认逻辑。
+        with open(root_pom, 'r', encoding='utf-8', errors='ignore') as f:  # 宽松读取 pom 文本。
+            pom_text = f.read()  # 读取完整 pom 内容做签名判断。
+    except Exception:
+        return ''  # 读取异常时不启用覆盖。
+    json_java_markers = (  # 该组合用于稳定识别当前失败集中唯一确认需要避开 JDK8 编译器边界的项目。
+        '<name>JSON in Java</name>',
+        'douglascrockford/JSON-java',
+        '<source>1.6</source>',
+        '<target>1.6</target>',
+    )  # 只有全部命中时才执行覆盖，避免把其他老项目误伤到 JDK11。
+    if all(marker in pom_text for marker in json_java_markers):  # `JSON-java` 在 JDK11 下可编译，而 JDK8 容易触发参考补丁编译边界问题。
+        return '11'  # 将该项目固定提升到 JDK11 镜像以提高 Docker 复现稳定性。
+    return ''  # 其余项目不启用覆盖。
 
 
 def pull_image(image: str) -> bool:
