@@ -912,6 +912,7 @@ python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 5 --rer
 - `workflow.py`不再在运行时查询参考补丁候选，失败后只会走`generated_patch`自身的上下文增强
 - `patch.py`里的import和dependency推断规则，来自离线成功样本归纳，但运行时只喂当前样本自己的`generated_patch`
 - `results.py`和失败诊断前缀也同步改成了`Generated patch context history`
+- 实际部署时即使没有`nondex_script/patch`和`patch-data`目录，主流程也仍然可以运行。那两部分现在只服务于离线分析和规则提炼。
 
 ### 和Docker的关系
 
@@ -920,11 +921,10 @@ python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 5 --rer
 - `v5`里剩余的大头失败不是Docker容器没有把项目跑起来
 - 更核心的问题是“补丁虽然进了容器，但补丁本身没被正确选中、没被正确贴上、或者没把所需上下文一起补齐”
 
-也就是说，Docker的职责仍然是稳定复现原始项目环境。要让容器内构建真正成功，前一步必须先保证参考补丁在当前原始SHA上是可编译的。单独把镜像换得再像，也修不好一个被错误helper、错误锚点或缺失依赖破坏掉的补丁。
+也就是说，Docker的职责仍然是稳定复现原始项目环境。真正影响容器内是否能构建成功的，是原始`generated_patch`有没有被正确贴到目标方法、有没有补齐它自己缺的import、dependency和`throws`，以及项目级JDK、模块reactor、settings和classifier有没有被正确复现。单独把镜像换得再像，也修不好一个上下文缺失或贴错位置的原始补丁。
 
 ### 本轮新增回归测试
 
-- 参考补丁在“文件内目标方法唯一”时可以放宽相似度保护
-- 数据集候选排序会优先选择标准API版本，而不是缺失helper版本
-- 参考补丁上下文推断会从原始方法声明补回异常import和依赖
-- 工作流回退时会继续使用原始`flaky_code`做锚点，并显式打开唯一方法放宽保护
+- 运行时在构建失败后只会走原始`generated_patch`自身的上下文增强
+- 原始`generated_patch`的上下文推断可以独立补出import和pom依赖
+- 离线参考候选检索只读取参考补丁目录，不再混入ground truth或其他数据集代码
