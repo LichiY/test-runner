@@ -3,8 +3,9 @@ import unittest  # 导入标准库测试框架。
 from pathlib import Path  # 导入路径工具简化测试文件创建。
 
 from rerun_tool.data import TestEntry  # 导入数据结构构造最小测试样本。
-from rerun_tool.patch import (apply_generated_patch_context, apply_patch, apply_reference_patch_context, find_reference_context_candidates, find_reference_patch_candidates,  # 导入待测的补丁应用、上下文推断与离线参考候选检索函数。
+from rerun_tool.patch import (apply_generated_patch_context, apply_patch, apply_reference_patch_context,  # 导入待测的补丁应用与上下文推断函数。
                               fix_missing_imports, fix_unreported_exception_declaration)  # 导入保守源码修复函数。
+from rerun_tool.reference_analysis import find_reference_context_candidates, find_reference_patch_candidates  # 导入仅供离线分析使用的参考候选检索函数。
 
 
 def _make_entry(flaky_code: str, generated_patch: str) -> TestEntry:  # 根据测试场景创建最小数据样本。

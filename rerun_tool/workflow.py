@@ -245,7 +245,7 @@ def _compact_error_message(message: str, limit: int = 4000) -> str:  # 在长度
 
 
 def _split_diagnostic_header_and_body(message: str) -> Tuple[str, str]:  # 将前置诊断头与真实构建输出主体拆开，避免压缩时丢掉关键回退轨迹。
-    diagnostic_prefixes = ('Generated patch context history:', 'Reference patch context history:', 'Reference patch fallback history:', 'Automatic repair history:')  # 当前需要优先保留的诊断前缀集合。
+    diagnostic_prefixes = ('Generated patch context history:', 'Reference patch context history:', 'Reference patch fallback history:', 'Automatic repair history:')  # 同时保留当前前缀和旧 reference 前缀，避免读取历史结果或旧错误文本时丢失诊断头。
     parts = [part.strip() for part in (message or '').split('\n\n')]  # 按空行切分多个前置诊断块与后续真实日志主体。
     diagnostic_parts = []  # 收集连续出现在最前面的诊断块。
     body_start = 0  # 记录真正日志主体从哪一块开始。

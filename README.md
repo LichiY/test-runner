@@ -911,6 +911,7 @@ python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 5 --rer
 
 - `workflow.py`不再在运行时查询参考补丁候选，失败后只会走`generated_patch`自身的上下文增强
 - `patch.py`里的import和dependency推断规则，来自离线成功样本归纳，但运行时只喂当前样本自己的`generated_patch`
+- `reference_analysis.py`单独承接参考补丁目录解析、候选归并和相似度筛选，这部分只给离线归因和规则提炼使用，不进入真实rerun主流程
 - `results.py`和失败诊断前缀也同步改成了`Generated patch context history`
 - 实际部署时即使没有`nondex_script/patch`和`patch-data`目录，主流程也仍然可以运行。那两部分现在只服务于离线分析和规则提炼。
 
