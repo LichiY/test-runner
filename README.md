@@ -110,12 +110,14 @@ python3 -m rerun_tool detect-flaky --repo-url https://github.com/SAP/emobility-s
 3. 应用补丁
 4. 构建
 5. 如果是补丁模式且构建失败，最多做 3 轮保守自动修复，包括普通 import、static import 和明显的类名大小写修正
-6. 多次重跑测试
+6. 如果还失败，先只根据原始`generated_patch`自身和原始方法签名补 import、dependency 和 checked exception
+7. 如果日志显示缺失的是项目测试 helper，且当前样本有 `fixed_sha`，再只从 `fixed_sha` 的测试源码里回溯 helper 定义和它依赖的上下文
+8. 多次重跑测试
 
 优点：
 
 - 可以直接回答“补丁后是否稳定”
-- 会自动处理一部分常见 import 缺失、static import 缺失和明显的符号大小写问题
+- 会自动处理一部分常见 import 缺失、static import 缺失、明显的符号大小写问题，以及同 PR 引入的测试 helper 缺口
 
 缺点：
 
@@ -845,11 +847,12 @@ python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 5 --rer
 - 它依赖真实场景里并不存在的外部成功样本
 - 它会模糊“我们在评估原始`generated_patch`”和“我们在借另一个补丁救场”之间的边界
 
-这一轮之后，运行时主流程明确只做下面几件事：
+这一轮之后，运行时主流程明确不再依赖参考补丁库和`fixed_code`，只保留下面几类真实可追溯的修复动作：
 
 - clone原始项目，并在Docker里尽量完整复现该项目需要的JDK、Maven settings、os classifier和模块reactor
 - 把原始`generated_patch`贴到原始测试文件
-- 如果构建失败，只从原始`generated_patch`自身和原始方法签名推断缺失的import、dependency和checked exception
+- 如果构建失败，先只从原始`generated_patch`自身和原始方法签名推断缺失的import、dependency和checked exception
+- 如果还失败，并且日志显示缺失的是测试侧 helper 方法，再只从同一仓库的`fixed_sha`测试源码里回溯 helper 定义和它依赖的import、dependency
 - 再次构建并rerun
 
 参考补丁库现在只保留两种作用：
@@ -859,10 +862,11 @@ python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 5 --rer
 
 当前代码里的对应实现是：
 
-- `workflow.py`不再在运行时查询参考补丁候选，失败后只会走`generated_patch`自身的上下文增强
+- `workflow.py`不再在运行时查询参考补丁候选，失败后先走`generated_patch`自身的上下文增强，再在必要时走`fixed_sha`测试helper回溯
 - `patch.py`里的import和dependency推断规则，来自离线成功样本归纳，但运行时只喂当前样本自己的`generated_patch`
+- `patch.py`新增了`fixed_sha`测试helper回溯逻辑，只会搜索`src/test/*`下的源码，不会回迁`src/main/`业务代码
 - `reference_analysis.py`单独承接参考补丁目录解析、候选归并和相似度筛选，这部分只给离线归因和规则提炼使用，不进入真实rerun主流程
-- `results.py`和失败诊断前缀也同步改成了`Generated patch context history`
+- `results.py`和失败诊断前缀会同时保留`Generated patch context history`和`Fixed-SHA helper backport`
 - 实际部署时即使没有`nondex_script/patch`和`patch-data`目录，主流程也仍然可以运行。那两部分现在只服务于离线分析和规则提炼。
 
 ### 和Docker的关系
@@ -879,3 +883,130 @@ python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 5 --rer
 - 运行时在构建失败后只会走原始`generated_patch`自身的上下文增强
 - 原始`generated_patch`的上下文推断可以独立补出import和pom依赖
 - 离线参考候选检索只读取参考补丁目录，不再混入ground truth或其他数据集代码
+
+## 第七轮复盘
+
+这一轮是直接针对`results/verify_patch_batch_build_run_failures_rerun1_v6.csv`和`Rerun Tool 优化方案报告.md`做的。前一轮没有真正吃掉`v6`里那批失败，根因不是Docker本身，而是我们对“这些补丁为什么在原始生成工具里能编过”的理解还差两步：
+
+- 只补`generated_patch`自身的import和dependency还不够，一批样本实际还依赖同一个PR在`fixed_sha`里新增的测试helper
+- import和dependency推断表还没覆盖`v6`里高频的Guava、typesafe-config、jackson-dataformat-xml、spring-test，以及`Option`这类有歧义的符号
+
+这一轮代码上补了三件事：
+
+- `repo.py`新增了按revision读取源码的能力。现在工具可以直接从本地对象库读取`fixed_sha:path`，不需要切换工作树。
+- `patch.py`新增了`fixed_sha`测试helper回溯。当前构建日志里如果是目标测试文件缺少方法，工具会优先去`fixed_sha`同文件、同目录和同模块`src/test/*`里找helper定义，把方法和所需import、pom上下文迁回`original_sha`工作区。这里仍然不使用参考补丁库，也不使用`fixed_code`。
+- `patch.py`同时扩了`v6`里高频缺失类的推断表，新增了`ImmutableList`、`StdDateFormat`、`XmlMapper`、`JsonMappingException`、`MockMvcRequestBuilders`、`ConfigFactory`、`ConfigResolveOptions`、`SortedMap`等映射，并把`Option`、`Config`、`Sets`这类容易误判的符号改成了上下文判断。
+
+这轮之后，运行时语义是：
+
+- 仍然只评估原始`generated_patch`
+- 仍然不使用参考补丁库和`fixed_code`
+- 但在样本自带`fixed_sha`且日志明确表明缺失的是测试helper时，允许把同一PR在`fixed_sha`里新增的测试基础设施迁回`original_sha`
+
+这样做的边界是：
+
+- 只回溯`src/test/*`里的helper，不回迁`src/main/`业务代码
+- helper回溯只在构建仍然失败、并且编译器明确报缺失方法时触发
+- 回溯完后仍然会重新走一次正常构建，而不是直接判成功
+
+本轮新增回归测试覆盖了这些新路径：
+
+- `fixed_sha` revision 缺失时会按revision补拉并直接读取源码
+- `generated_patch`会补出Guava和typesafe-config的import与pom依赖
+- `IGNORING_ARRAY_ORDER`会绑定到json-unit的`Option`而不是json-path
+- `fixed_sha`里的helper方法会被迁回当前测试类，并同步补入它依赖的import和pom
+- 工作流在`generated_patch`自身上下文不足时，会继续尝试`fixed_sha` helper回溯
+
+## 第八轮复盘
+
+这一轮直接重新检查了`results/verify_patch_batch_build_run_failures_rerun1_v7.csv`，并生成了逐条诊断文件`results/verify_patch_batch_build_run_failures_rerun1_v7_diagnosis.csv`。`v7`里共有`99`条`build_failed`，其中`76`条`original_rerun_consistency=1.0`，说明大头仍然是工具没有把“本来能构建的补丁”正确送到可编译状态。
+
+### `v7`里剩余失败的结构
+
+按逐条错误归因，这`99`条主要分成下面几类：
+
+- `target_test_context_gap` `34`条
+  目标测试文件本身还缺helper、static import或同文件import。典型项目是`graylog2-server`、`druid`、`cloud-slang`、`Gaffer`、`adyen-java-api-library`、`skywalking-java`。
+- `patch_invalid_source` `14`条
+  典型是`JSON-java`。日志已经是`illegal character`和语法错误，这不是Docker或pom问题，而是`generated_patch`文本本身在`original_sha`上不是合法Java源码。
+- `project_dependency_context_gap` `8`条
+  典型是`apollo`。补丁引入的类型不仅影响目标测试，还影响模块级或主源码依赖解析，旧版只在单个测试文件补import不够。
+- `patch_local_context_removed` `8`条
+  典型是`shenyu`。补丁本身删掉了局部变量声明，失败来自补丁内部上下文丢失，不是环境问题。
+- `non_target_module_context_gap` `7`条
+  典型是`pulsar`和`seatunnel`。目标测试已经部分修好，但模块`test-compile`还会编译别的测试文件，旧版工具完全不处理这些非目标测试的上下文缺口。
+- `patch_api_mismatch` `6`条
+  典型是`mybatis-3`和`jinjava`。补丁调用了当前`original_sha`下不成立的API形态，继续补import或helper不会直接变成可编译。
+- `fixed_sha_context_over_import` `4`条
+  典型是`cloudstack`。旧版把`fixed_sha`源文件的整段import一起搬回来，结果把`VolumeStatsVO`、`VolumeStatsDao`、`MockedStatic`这类当前SHA里不存在的无关类型也带回来了。
+- `generated_context_conflicting_import` `2`条
+  典型是`fastjson`。旧版`generated_patch`上下文推断会盲补`TypeReference`这类同名不同库的import，直接把当前文件变成single-type-import冲突。
+- `unsafe_symbol_rewrite` `2`条
+  典型是`incubator-streampipes`。旧版自动修复把`JSONObject`误改成了Gson的`JsonObject`，语义直接漂移。
+- `fixed_sha_field_context_gap` `2`条
+  典型是`hertzbeat`。旧版只会从`fixed_sha`回补方法，不会回补`JSON_MAPPER`这类字段或常量。
+
+### 上一轮为什么没有解决这些问题
+
+前一轮真正没解决掉的，不是“规则还不够多”，而是下面几件事仍然做错了：
+
+- 结果CSV还在丢关键上下文
+  从`v4`到`v7`的结果文件都没有保留`fixed_sha`、`generated_patch`、`flaky_code`、`fixed_code`这些后续诊断和复现真正需要的列。这样一来，失败复盘会越来越依赖人工回查原输入，而不是结果文件本身。
+- `fixed_sha`回补粒度太粗
+  旧版只会迁回方法，不会迁回字段、常量和同文件import。
+- `fixed_sha`回补带回了整文件import
+  这会把helper真正需要的import和无关import一起搬回来，直接制造新的编译失败。
+- `generated_patch`上下文推断没有尊重当前文件和当前仓库已有线索
+  它会见到`TypeReference`就补Jackson，见到`Sets`就补Guava，没有先看当前文件已有import、仓库里现成import和当前调用形态。
+- `assertThat`识别仍然太脆弱
+  旧版只会识别非常简单的`assertThat(x).isEqualTo(...)`。一旦写成`assertThat(values.keySet()).containsExactlyInAnyOrderElementsOf(...)`这种带嵌套括号的真实代码，自动修复就看不出来。
+- 符号大小写修复边界不对
+  `JSONPath`这类仓库内真实类名应该允许修正，`JSONObject->JsonObject`这种跨库语义漂移必须禁止。旧版没有把这两类分开。
+
+### 这一轮代码上的具体修复
+
+- `results.py`
+  结果CSV现在会把`repo_owner`、`fixed_sha`、`source_file`、`flaky_code`、`fixed_code`、`diff`、`generated_patch`一并保留下来。下一轮重跑和诊断不需要再回头翻原始输入CSV。
+- `patch.py`
+  `generated_patch`上下文推断改成优先尊重当前文件和当前仓库已有证据。`TypeReference`、`Sets`、`Config`、`Option`这类高歧义符号，不再直接按内置表盲补。
+- `patch.py`
+  `assertThat`识别改成支持带嵌套括号的链式断言，`entry(...)`也新增了AssertJ的保守解析路径。这一块直接对应`graylog2-server`、`druid`、`cloud-slang`、`Gaffer`。
+- `patch.py`
+  `fixed_sha`回补从“只会迁方法”扩成了“方法 + 字段/常量 + 同文件import”。`hertzbeat`这类`JSON_MAPPER`缺失，和`skywalking-java`这类同文件import缺失，现在都能走这条路径。
+- `patch.py`
+  `fixed_sha`成员回补只保留当前helper或字段真正引用到的import，不再把整文件import全搬回来。这个改动就是为了解掉`cloudstack`这类过度回补。
+- `patch.py`
+  类成员插入位置改成按顶层类闭合大括号定位，不再简单靠最后一个`}`。这块是为了避免`nutz`那类“helper找到了但插回去后文件结构坏掉”的问题。
+- `patch.py`
+  自动大小写修复新增了“仓库内源码存在性”约束。仓库里确实有这个类，像`JSONPath`，才允许继续做大小写修正；只是在第三方依赖里lower相同，像`JSONObject->JsonObject`，就直接拒绝。
+- `patch.py`
+  新增了同名import冲突保护。当前文件已经有`com.alibaba.fastjson.TypeReference`时，不会再插入`com.fasterxml.jackson.core.type.TypeReference`。
+
+### 和Docker的关系
+
+这一轮重新确认了一个边界：
+
+- `v7`里剩余的大头失败，主因已经不是Docker没把项目跑起来
+- Docker现在更像是“把项目环境完整复现”的前提层
+- 真正导致还编不过的，是补丁上下文回补粒度、import解析优先级和`fixed_sha`成员回补策略
+
+也就是说，Docker仍然必须完整模拟项目环境，但不能把“补丁已经被错误改写”或“helper回补方式本身有问题”这类失败误判成环境失败。
+
+### 这一轮新增回归测试
+
+- 结果CSV会保留`fixed_sha`、`generated_patch`、`flaky_code`等原始补丁上下文字段
+- `assertThat(values.keySet())`这类带嵌套括号的AssertJ链式断言也能补入正确的static import
+- `entry(...)`会在仓库已依赖AssertJ时补入`org.assertj.core.api.Assertions.entry`
+- `JSONObject`不会再被错误改写成Gson的`JsonObject`
+- `fixed_sha`字段和常量可以被迁回当前测试类
+- `fixed_sha`同文件里的import可以被复用到`original_sha`
+- helper和字段回补只会保留真正相关的import，不再整文件搬运
+- `generated_patch`上下文增强不会再插入同名不同库的冲突import
+
+### 当前验证状态
+
+- 逐条诊断文件已生成：`results/verify_patch_batch_build_run_failures_rerun1_v7_diagnosis.csv`
+- 单元测试已通过：`python3 -m pytest tests -q`
+- 当前结果：`98 passed`
+
+这轮完成的是工具代码和README同步，还没有用“生成`v7.csv`的原始输入批次”在当前代码上重新全量重跑。所以现在不能直接声称`v7`里这`24%`已经被清零。下一步应该直接拿原始输入批次重跑，而不是继续用`v7.csv`当输入。

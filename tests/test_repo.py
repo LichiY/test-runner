@@ -4,7 +4,8 @@ import unittest  # 导入标准库测试框架。
 from pathlib import Path  # 导入路径工具简化测试目录创建。
 from unittest import mock  # 导入 mock 以便隔离真实 Git 命令执行。
 
-from rerun_tool.repo import _run_git, clone_repo  # 导入待测的 Git 准备入口函数与底层 Git 执行器。
+from rerun_tool.repo import (_run_git, clone_repo, ensure_revision_available,  # 导入待测的 Git 准备入口函数与底层 Git 执行器。
+                             list_files_at_revision, read_file_at_revision)  # 导入 fixed_sha 辅助读取函数。
 
 
 class RepoBehaviorTests(unittest.TestCase):  # 测试 Git clone、fetch 与 checkout 加固逻辑。
@@ -82,6 +83,37 @@ class RepoBehaviorTests(unittest.TestCase):  # 测试 Git clone、fetch 与 chec
         env = mocked_run.call_args.kwargs['env']  # 读取传给 subprocess.run 的环境变量字典。
         self.assertEqual(env['GIT_HTTP_LOW_SPEED_LIMIT'], '1')  # 断言 Git HTTP 低速阈值会被显式设置。
         self.assertEqual(env['GIT_HTTP_LOW_SPEED_TIME'], '1800')  # 断言 Git HTTP 低速容忍时间会与命令超时保持一致。
+
+    def test_ensure_revision_available_fetches_missing_commit_on_demand(self):  # 验证 fixed_sha 在本地缺失时会按 revision 做一次补拉。
+        missing_revision = subprocess.CompletedProcess(args=['git', 'cat-file'], returncode=128, stdout='', stderr='fatal: Not a valid object name')  # 伪造本地尚未包含目标 revision。
+        fetch_success = subprocess.CompletedProcess(args=['git', 'fetch'], returncode=0, stdout='fetched', stderr='')  # 伪造按 revision fetch 成功。
+        revision_now_available = subprocess.CompletedProcess(args=['git', 'cat-file'], returncode=0, stdout='', stderr='')  # 伪造 fetch 后 revision 已可读。
+        with mock.patch('rerun_tool.repo._run_git', side_effect=[missing_revision, fetch_success, revision_now_available]) as mocked_git:  # 拦截全部 Git 调用。
+            ok, message = ensure_revision_available('/tmp/demo', 'a' * 40, timeout=30, max_retries=0)  # 执行按 revision 补拉流程。
+        self.assertTrue(ok)  # 断言最终会成功确认 revision 可用。
+        self.assertIn('Fetched revision', message)  # 断言返回消息会明确说明这次成功来自按 revision fetch。
+        self.assertEqual(mocked_git.call_args_list[1].args[1], ['git', 'fetch', 'origin', 'a' * 40])  # 断言中间确实执行了按 revision 的 fetch。
+
+    def test_list_files_at_revision_uses_git_ls_tree_with_prefix(self):  # 验证列 revision 文件时会把路径前缀传给 git ls-tree。
+        ls_tree_success = subprocess.CompletedProcess(  # 伪造一个最小的 ls-tree 成功结果。
+            args=['git', 'ls-tree'],
+            returncode=0,
+            stdout='src/test/java/com/example/ExampleTest.java\nsrc/test/java/com/example/Helper.java\n',
+            stderr='',
+        )  # 完成伪造结果构造。
+        with mock.patch('rerun_tool.repo._run_git', return_value=ls_tree_success) as mocked_git:  # 拦截底层 Git 调用。
+            ok, files = list_files_at_revision('/tmp/demo', 'b' * 40, 'src/test/java/com/example', timeout=30)  # 执行 revision 文件列表读取。
+        self.assertTrue(ok)  # 断言当前读取流程成功。
+        self.assertEqual(files, ['src/test/java/com/example/ExampleTest.java', 'src/test/java/com/example/Helper.java'])  # 断言返回文件列表保持 Git 输出顺序。
+        self.assertEqual(mocked_git.call_args.args[1], ['git', 'ls-tree', '-r', '--name-only', 'b' * 40, '--', 'src/test/java/com/example'])  # 断言命令行正确携带 revision 和 pathspec。
+
+    def test_read_file_at_revision_uses_git_show_without_touching_worktree(self):  # 验证读取 revision 文件内容时会直接走 git show。
+        git_show_success = subprocess.CompletedProcess(args=['git', 'show'], returncode=0, stdout='class ExampleTest {}\n', stderr='')  # 伪造 git show 成功结果。
+        with mock.patch('rerun_tool.repo._run_git', return_value=git_show_success) as mocked_git:  # 拦截底层 Git 调用。
+            ok, content = read_file_at_revision('/tmp/demo', 'c' * 40, 'src/test/java/com/example/ExampleTest.java', timeout=30)  # 执行 revision 文件读取。
+        self.assertTrue(ok)  # 断言当前读取流程成功。
+        self.assertEqual(content, 'class ExampleTest {}\n')  # 断言返回内容来自 git show 标准输出。
+        self.assertEqual(mocked_git.call_args.args[1], ['git', 'show', f'{"c" * 40}:src/test/java/com/example/ExampleTest.java'])  # 断言不会通过 checkout 改写工作树。
 
 
 if __name__ == '__main__':  # 允许单文件直接运行测试。

@@ -107,6 +107,23 @@ class ResultsBehaviorTests(unittest.TestCase):  # 测试历史结果恢复逻辑
                 row = next(csv.DictReader(f))  # 读取唯一一条结果。
         self.assertEqual(row['original_rerun_consistency'], 'INCONSISTENT')  # 断言原始 rerun_consistency 会被写出到结果 CSV。
 
+    def test_write_results_csv_preserves_original_patch_context_columns(self):  # 验证结果文件会保留 fixed_sha、flaky_code 和 generated_patch 等后续诊断必需列。
+        result = TestRunResult(entry=_make_entry(12), status='build_failed', error_message='boom')  # 构造一个最小构建失败结果。
+        result.entry.source_file = 'src/test/java/com/example/ExampleTest.java'  # 写入源文件路径。
+        result.entry.fixed_code = 'public void fixedCase() {}'  # 写入 ground-truth fixed_code 供离线诊断使用。
+        result.entry.diff = '@@ -1 +1 @@'  # 写入最小 diff 文本。
+        with tempfile.TemporaryDirectory() as tmp_dir:  # 创建隔离的临时目录。
+            output_path = Path(tmp_dir) / 'results.csv'  # 构造结果文件路径。
+            write_results_csv([result], str(output_path), rerun_count=1)  # 将结果写出到 CSV。
+            with output_path.open('r', newline='', encoding='utf-8') as f:  # 重新读取写出的结果文件。
+                row = next(csv.DictReader(f))  # 读取唯一一条结果。
+        self.assertEqual(row['fixed_sha'], 'b' * 40)  # 断言修复提交号会被完整写出。
+        self.assertEqual(row['source_file'], 'src/test/java/com/example/ExampleTest.java')  # 断言源文件路径会被写出。
+        self.assertEqual(row['flaky_code'], 'public void test() {}')  # 断言原始 flaky 方法文本会被写出。
+        self.assertEqual(row['fixed_code'], 'public void fixedCase() {}')  # 断言 fixed_code 只作为离线诊断列被写出。
+        self.assertEqual(row['generated_patch'], 'public void test() {}')  # 断言真实被评估的 generated_patch 会被写出。
+        self.assertEqual(row['diff'], '@@ -1 +1 @@')  # 断言原始 diff 文本会被写出。
+
     def test_print_summary_outputs_verdict_counts(self):  # 验证结果摘要会完整打印数量与 verdict 统计。 
         result = TestRunResult(entry=_make_request(1), status='completed', results=['pass', 'fail'])  # 构造一个会被判定为 FLAKY 的结果对象。 
         buffer = io.StringIO()  # 创建内存文本流用于捕获标准输出。 

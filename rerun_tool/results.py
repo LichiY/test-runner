@@ -33,14 +33,21 @@ def write_results_csv(results: List[TestRunResult], output_path: str, rerun_coun
         'input_source',  # 保存输入来源。 
         'patch_mode',  # 保存补丁模式。 
         'repo_url',  # 保存仓库地址。 
+        'repo_owner',  # 保存仓库 owner，便于后续重新定位工作区。 
         'project_name',  # 保存项目名。 
         'module',  # 保存模块名。 
         'test_class',  # 保存测试类名。 
         'test_method',  # 保存测试方法名。 
         'full_test_name',  # 保存完整测试名。 
         'original_sha',  # 保存原始提交号。 
+        'fixed_sha',  # 保存修复提交号，便于后续 fixed_sha 上下文回查。 
         'pr_link',  # 保存 PR 链接。 
         'is_correct_label',  # 保存标签字段。 
+        'source_file',  # 保存源文件路径。 
+        'flaky_code',  # 保存原始 flaky 方法文本，便于后续诊断。 
+        'fixed_code',  # 保留 ground-truth 测试代码，仅供离线分析，不作为运行时补丁。 
+        'diff',  # 保存原始 diff 文本供离线分析。 
+        'generated_patch',  # 保存真实被评估的 generated_patch，便于复现实验。 
         'original_rerun_consistency',  # 保存原始输入里的 rerun_consistency 字段。 
         'status',  # 保存流程状态。 
         'rerun_results',  # 仅保存 JSON 数组形式的逐轮结果，不再展开为 run_i 列。 
@@ -75,14 +82,21 @@ def write_results_csv(results: List[TestRunResult], output_path: str, rerun_coun
                 'input_source': _entry_input_source(r.entry),  # 写入输入来源。 
                 'patch_mode': _entry_patch_mode(r.entry),  # 写入补丁模式。 
                 'repo_url': getattr(r.entry, 'repo_url', ''),  # 写入仓库地址。 
+                'repo_owner': getattr(r.entry, 'repo_owner', ''),  # 写入仓库 owner。 
                 'project_name': getattr(r.entry, 'project_name', ''),  # 写入项目名。 
                 'module': getattr(r.entry, 'module', ''),  # 写入模块名。 
                 'test_class': getattr(r.entry, 'test_class', ''),  # 写入测试类名。 
                 'test_method': getattr(r.entry, 'test_method', ''),  # 写入测试方法名。 
                 'full_test_name': getattr(r.entry, 'full_test_name', ''),  # 写入完整测试名。 
                 'original_sha': getattr(r.entry, 'original_sha', ''),  # 写入原始提交号。 
+                'fixed_sha': getattr(r.entry, 'fixed_sha', ''),  # 写入修复提交号。 
                 'pr_link': getattr(r.entry, 'pr_link', ''),  # 写入 PR 链接。 
                 'is_correct_label': getattr(r.entry, 'is_correct', ''),  # 写入标签字段。 
+                'source_file': getattr(r.entry, 'source_file', ''),  # 写入源文件路径。 
+                'flaky_code': getattr(r.entry, 'flaky_code', ''),  # 写入原始 flaky 方法文本。 
+                'fixed_code': getattr(r.entry, 'fixed_code', ''),  # 写入 ground-truth 测试代码文本，供离线诊断。 
+                'diff': getattr(r.entry, 'diff', ''),  # 写入原始 diff 文本。 
+                'generated_patch': getattr(r.entry, 'generated_patch', ''),  # 写入真实被评估的生成补丁。 
                 'original_rerun_consistency': getattr(r.entry, 'original_rerun_consistency', ''),  # 写入原始输入中的 rerun consistency 字段。 
                 'status': r.status,  # 写入流程状态。 
                 'rerun_results': json.dumps(r.results),  # 仅保留 JSON 数组形式的逐轮结果。 

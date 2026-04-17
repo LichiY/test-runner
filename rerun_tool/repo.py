@@ -6,7 +6,7 @@ import os  # 导入路径工具判断工作区与仓库状态。
 import shutil  # 导入目录清理工具修复残缺工作区。
 import subprocess  # 导入子进程工具执行 Git 命令。
 import time  # 导入时间工具实现有限退避重试。
-from typing import Optional  # 导入可选类型注解工具。
+from typing import Optional, Tuple  # 导入可选类型注解工具。
 
 logger = logging.getLogger(__name__)  # 创建当前模块的日志记录器。
 
@@ -98,6 +98,64 @@ def reset_repo(repo_dir: str, timeout: int = 120) -> bool:  # 将仓库恢复到
     except Exception as e:  # 捕获 reset 过程中的异常。
         logger.error(f"Reset failed: {e}")  # 记录仓库复位失败原因。
         return False  # 将 reset 失败反馈给调用方。
+
+
+def ensure_revision_available(repo_dir: str, revision: str, timeout: int = DEFAULT_GIT_TIMEOUT, max_retries: int = 1) -> Tuple[bool, str]:  # 确保指定 revision 在当前本地仓库里可读，供 fixed_sha 辅助检索等场景复用。
+    normalized_revision = (revision or '').strip()  # 先规整待检查的 revision 文本。
+    if not normalized_revision:  # 缺失 revision 时无法继续检查。
+        return False, 'No revision provided'  # 返回明确错误信息，避免上层误判成 Git 读取失败。
+    probe_result = _run_git(repo_dir, ['git', 'cat-file', '-e', f'{normalized_revision}^{{commit}}'], timeout=timeout)  # 先探测当前本地仓库是否已经包含该提交对象。
+    if probe_result.returncode == 0:  # 本地已经可读时无需再次 fetch。
+        return True, f"Revision {normalized_revision[:8]} already available"  # 直接返回成功结果。
+    total_attempts = max(1, max_retries + 1)  # 统一计算“按 revision fetch”的总尝试次数。
+    last_message = _format_git_failure(stage='fetch_revision', repo_url='origin', sha=normalized_revision, output=_combined_output(probe_result), attempt=1, total_attempts=total_attempts)  # 用首次 probe 失败初始化兜底消息。
+    for attempt in range(total_attempts):  # 对按 revision fetch 执行有限次数的重试。
+        attempt_number = attempt + 1  # 转成人类可读的尝试编号。
+        try:  # 单独捕获按 revision fetch 的超时异常。
+            fetch_result = _run_git(repo_dir, ['git', 'fetch', 'origin', normalized_revision], timeout=timeout)  # 优先尝试只拉取目标 revision，避免再次下载整个远端引用集合。
+        except subprocess.TimeoutExpired:  # 网络慢或远端卡住时把它视为可恢复的 Git 问题。
+            last_message = _format_timeout_message(stage='fetch_revision', repo_url='origin', sha=normalized_revision, timeout=timeout, attempt=attempt_number, total_attempts=total_attempts)  # 统一构造超时消息。
+            if attempt < total_attempts - 1:  # 仍有剩余尝试次数时继续。
+                _sleep_before_retry(attempt)  # 在下一轮之前做短退避。
+                continue  # 进入下一次尝试。
+            return False, last_message  # 用尽重试后返回失败。
+        if fetch_result.returncode != 0:  # 直接按 revision fetch 失败时记录当前错误并在可恢复情况下继续。
+            last_message = _format_git_failure(stage='fetch_revision', repo_url='origin', sha=normalized_revision, output=_combined_output(fetch_result), attempt=attempt_number, total_attempts=total_attempts)  # 构造当前失败消息。
+            if attempt < total_attempts - 1 and _is_recoverable_git_error(last_message):  # 只对可恢复错误继续重试。
+                _sleep_before_retry(attempt)  # 在下一轮前做退避。
+                continue  # 继续下一次尝试。
+            return False, last_message  # 其余情况直接返回当前失败消息。
+        probe_result = _run_git(repo_dir, ['git', 'cat-file', '-e', f'{normalized_revision}^{{commit}}'], timeout=timeout)  # fetch 成功后再次确认当前 revision 真的已经可读。
+        if probe_result.returncode == 0:  # revision 已经落到本地对象库时返回成功。
+            return True, f"Fetched revision {normalized_revision[:8]} from origin"  # 返回成功消息。
+        last_message = _format_git_failure(stage='fetch_revision', repo_url='origin', sha=normalized_revision, output=_combined_output(probe_result), attempt=attempt_number, total_attempts=total_attempts)  # 记录“fetch 后仍不可读”的异常场景。
+    return False, last_message  # 理论兜底返回最终失败消息。
+
+
+def list_files_at_revision(repo_dir: str, revision: str, path_prefix: str = '', timeout: int = 120) -> Tuple[bool, list[str] | str]:  # 列出某个 revision 下指定前缀路径内的文件，供 fixed_sha helper 检索复用。
+    normalized_revision = (revision or '').strip()  # 先规整 revision 文本。
+    if not normalized_revision:  # 缺失 revision 时无法继续。
+        return False, 'No revision provided'  # 返回明确错误。
+    normalized_prefix = (path_prefix or '').strip().strip('/')  # 统一规整路径前缀，避免多余斜杠影响 Git pathspec。
+    cmd = ['git', 'ls-tree', '-r', '--name-only', normalized_revision]  # 先准备列树命令。
+    if normalized_prefix:  # 只有真的给出路径前缀时才追加 pathspec。
+        cmd.extend(['--', normalized_prefix])  # 用 pathspec 将扫描范围限制到目标目录。
+    result = _run_git(repo_dir, cmd, timeout=timeout)  # 执行 Git 列树命令。
+    if result.returncode != 0:  # Git 读取失败时返回带阶段信息的错误消息。
+        return False, _format_git_failure(stage='ls_tree', repo_url='origin', sha=normalized_revision, output=_combined_output(result), attempt=1, total_attempts=1)  # 将错误包装成可直接透传的诊断文本。
+    files = [line.strip() for line in result.stdout.splitlines() if line.strip()]  # 过滤空行并保持 Git 返回顺序。
+    return True, files  # 返回当前 revision 下的文件列表。
+
+
+def read_file_at_revision(repo_dir: str, revision: str, relative_path: str, timeout: int = 120) -> Tuple[bool, str]:  # 读取某个 revision 下的单个文件内容，供 fixed_sha helper 回溯和离线分析复用。
+    normalized_revision = (revision or '').strip()  # 先规整 revision 文本。
+    normalized_path = (relative_path or '').strip().lstrip('./').replace(os.sep, '/')  # 统一规整相对路径，避免 Windows 风格分隔符影响 Git show。
+    if not normalized_revision or not normalized_path:  # revision 或路径缺失时都无法继续。
+        return False, 'Missing revision or relative path'  # 返回明确错误信息。
+    result = _run_git(repo_dir, ['git', 'show', f'{normalized_revision}:{normalized_path}'], timeout=timeout)  # 直接从对象库中读取目标文件内容，不污染当前工作树。
+    if result.returncode != 0:  # 读取失败时包装成统一错误消息。
+        return False, _format_git_failure(stage='git_show', repo_url='origin', sha=f'{normalized_revision}:{normalized_path}', output=_combined_output(result), attempt=1, total_attempts=1)  # 返回包含具体 revision:path 的错误。
+    return True, result.stdout  # 返回成功读取到的文件内容。
 
 
 def _prepare_existing_repo(repo_url: str, target_dir: str, sha: str, timeout: int, max_retries: int, repaired_workspace: bool) -> GitPrepareResult:  # 在已有仓库副本上执行校验、清理和检出。
