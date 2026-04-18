@@ -177,7 +177,7 @@ def _compact_csv_error_message(message: str, limit: int = CSV_ERROR_MESSAGE_LIMI
 
 
 def _split_csv_diagnostic_header_and_body(message: str) -> Tuple[str, str]:  # 将结果 CSV 里的前置诊断头和真实错误主体拆开。
-    diagnostic_prefixes = ('Generated patch context history:', 'Reference patch context history:', 'Reference patch fallback history:', 'Automatic repair history:')  # 同时兼容当前前缀和旧 reference 前缀，避免历史 CSV 的诊断头在压缩时丢失。
+    diagnostic_prefixes = ('Generated patch context history:', 'Reference patch context history:', 'Reference patch fallback history:', 'Automatic repair history:', 'Related test import repair:', 'Fixed-SHA helper backport:')  # 同时兼容当前前缀和旧 reference 前缀，避免历史 CSV 的诊断头在压缩时丢失。
     parts = [part.strip() for part in (message or '').split('\n\n')]  # 按空行切分多个前置诊断块与后续日志主体。
     diagnostic_parts = []  # 收集连续出现在最前面的诊断块。
     body_start = 0  # 记录真正日志主体从哪一块开始。

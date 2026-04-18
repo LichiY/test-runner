@@ -7,7 +7,7 @@ from typing import Optional, Tuple  # 导入类型注解工具。
 from .data import PatchSpec, RunRequest, RunnerBackend, WorkflowKind  # 导入统一请求模型与工作流枚举。 
 from .docker import should_use_docker  # 导入 Docker 自动决策函数。 
 from .patch import (apply_generated_patch_context, apply_patch, backport_fixed_sha_test_helpers,  # 导入测试文件定位、补丁应用与基于原始 generated_patch 的上下文补全能力。
-                    find_test_file, fix_missing_imports, fix_unreported_exception_declaration, restore_backup)  # 继续导入保守自动修复和原始文件恢复函数。 
+                    find_test_file, fix_missing_imports, fix_related_test_imports, fix_unreported_exception_declaration, restore_backup)  # 继续导入保守自动修复、同模块连带测试修复和原始文件恢复函数。 
 from .repo import clone_repo, reset_repo  # 导入仓库克隆与复位函数。 
 from .runner import ExecutionEnvironment, RerunExecutionSummary, RerunMode, TestRunResult, build_project, detect_build_tool, resolve_execution_environment, run_test_with_summary  # 导入执行层能力与统一环境决策结构。 
 
@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)  # 创建当前模块的日志记录器。
 
 MAX_AUTOMATIC_BUILD_REPAIR_ROUNDS = 3  # 将保守自动修复限制在最多 3 轮，避免在不可修复样本上无止境反复构建。 
 MAX_FIXED_SHA_HELPER_BACKPORT_ROUNDS = 2  # fixed_sha helper 回溯最多执行两轮，覆盖 helper 依赖另一个 helper 的常见链式场景。 
+MAX_RELATED_TEST_REPAIR_ROUNDS = 2  # 同模块非目标测试的连带 import 修复只做有限轮次，避免一次构建失败牵出过多无关改动。
 
 
 @dataclass  # 定义运行期执行配置。 
@@ -124,6 +125,7 @@ def process_request(request: RunRequest, workspace_dir: str, config: ExecutionCo
     build_ok, build_output = build_project(repo_dir=repo_dir, entry=request, use_docker=execution_env.use_docker, timeout=config.build_timeout, max_retries=config.build_retries, execution_env=execution_env)  # 先编译测试与依赖，并复用统一环境决策。 
     build_ok, build_output = _repair_build_if_possible(repo_dir=repo_dir, request=request, test_file=test_file, preparer=preparer, execution_env=execution_env, config=config, build_ok=build_ok, build_output=build_output)  # 在首次构建失败后执行有限轮次的保守自动修复。 
     build_ok, build_output = _augment_generated_patch_context_if_possible(repo_dir=repo_dir, request=request, test_file=test_file, preparer=preparer, execution_env=execution_env, config=config, build_ok=build_ok, build_output=build_output)  # 对构建失败的原始补丁再尝试从 generated_patch 自身推断 import/pom 上下文。 
+    build_ok, build_output = _repair_related_test_context_if_possible(repo_dir=repo_dir, request=request, test_file=test_file, preparer=preparer, execution_env=execution_env, config=config, build_ok=build_ok, build_output=build_output)  # 当模块内其他测试源码也被 test-compile 连带卡住时，再尝试对这些非目标测试文件做保守 import 修复。
     build_ok, build_output = _augment_fixed_sha_helpers_if_possible(repo_dir=repo_dir, request=request, test_file=test_file, preparer=preparer, execution_env=execution_env, config=config, build_ok=build_ok, build_output=build_output)  # 当 generated_patch 还依赖 PR 在 fixed_sha 里新增的测试 helper 时，再尝试回溯该 helper 定义。 
     if not build_ok:  # 构建仍然失败时返回 build_failed。 
         logger.error(f"Build failed: {build_output[-500:]}")  # 记录构建尾部日志帮助排查。 
@@ -219,6 +221,29 @@ def _augment_generated_patch_context_if_possible(repo_dir: str, request: RunRequ
     return False, f"Generated patch context history: {' | '.join(fallback_history)}\n\n{candidate_build_output}"  # 返回增强后的最终构建错误，便于后续继续分析。 
 
 
+def _repair_related_test_context_if_possible(repo_dir: str, request: RunRequest, test_file: Optional[str], preparer: WorkspacePreparer, execution_env: ExecutionEnvironment, config: ExecutionConfig, build_ok: bool, build_output: str) -> Tuple[bool, str]:  # 当模块内非目标测试也因为缺 import 被 test-compile 连带卡住时，尝试对这些文件做同样的保守修复。
+    if build_ok or request.workflow != WorkflowKind.VERIFY_PATCH or not test_file or not preparer.should_attempt_import_fix():  # 只有 verify-patch 且当前仍然构建失败时才需要处理非目标测试上下文。
+        return build_ok, build_output
+    related_history = []  # 记录每一轮非目标测试修复的摘要，便于最终写回错误消息。
+    current_build_output = build_output  # 保存当前轮次的构建日志，供下一轮继续提取非目标测试文件。
+    for repair_round in range(1, MAX_RELATED_TEST_REPAIR_ROUNDS + 1):  # 对同模块非目标测试上下文修复执行有限轮次。
+        logger.warning(f"Build still failing, attempting related test import repair ({repair_round}/{MAX_RELATED_TEST_REPAIR_ROUNDS})...")  # 记录当前进入第几轮非目标测试修复。
+        repaired, repair_msg = fix_related_test_imports(repo_dir, test_file, current_build_output)  # 只对当前构建日志里真正报错的非目标测试文件做保守 import 修复。
+        if not repaired:  # 当前轮没有新的非目标测试可修复时停止继续尝试。
+            if repair_msg:  # 只有存在明确原因时才写入历史。
+                related_history.append(f"round {repair_round}: {repair_msg}")  # 保留本轮未命中的原因，便于后续诊断。
+            break
+        related_history.append(f"round {repair_round}: {repair_msg}")  # 记录本轮真正发生的非目标测试修复动作。
+        candidate_build_ok, candidate_build_output = build_project(repo_dir=repo_dir, entry=request, use_docker=execution_env.use_docker, timeout=config.build_timeout, max_retries=config.build_retries, execution_env=execution_env)  # 修复后立即复用同一环境重新构建。
+        if candidate_build_ok:  # 任一轮非目标测试修复后构建成功就提前返回。
+            prefix = f"Related test import repair: {' | '.join(related_history)}"  # 在最终构建输出前附加成功的修复摘要。
+            return True, f"{prefix}\n\n{candidate_build_output}" if candidate_build_output else prefix
+        current_build_output = candidate_build_output  # 当前轮仍失败时保留新的构建日志供下一轮继续分析。
+    if not related_history:  # 一轮都没真正进入非目标测试修复时直接保留原始构建输出。
+        return build_ok, build_output
+    return False, f"Related test import repair: {' | '.join(related_history)}\n\n{current_build_output}"  # 构建仍失败时把非目标测试修复历史写回错误消息头部。
+
+
 def _augment_fixed_sha_helpers_if_possible(repo_dir: str, request: RunRequest, test_file: Optional[str], preparer: WorkspacePreparer, execution_env: ExecutionEnvironment, config: ExecutionConfig, build_ok: bool, build_output: str) -> Tuple[bool, str]:  # 当 generated_patch 还依赖 fixed_sha 中新增的测试 helper 时，回溯 helper 定义并重试构建。
     if build_ok or request.workflow != WorkflowKind.VERIFY_PATCH or not test_file or not getattr(request, 'fixed_sha', '').strip():  # 只有 verify-patch、构建失败且存在 fixed_sha 时才值得进入 helper 回退。
         return build_ok, build_output  # 其余场景保持原结果不变。
@@ -271,7 +296,7 @@ def _compact_error_message(message: str, limit: int = 4000) -> str:  # 在长度
 
 
 def _split_diagnostic_header_and_body(message: str) -> Tuple[str, str]:  # 将前置诊断头与真实构建输出主体拆开，避免压缩时丢掉关键回退轨迹。
-    diagnostic_prefixes = ('Generated patch context history:', 'Reference patch context history:', 'Reference patch fallback history:', 'Automatic repair history:', 'Fixed-SHA helper backport:')  # 同时保留当前前缀和旧 reference 前缀，避免读取历史结果或旧错误文本时丢失诊断头。
+    diagnostic_prefixes = ('Generated patch context history:', 'Reference patch context history:', 'Reference patch fallback history:', 'Automatic repair history:', 'Related test import repair:', 'Fixed-SHA helper backport:')  # 同时保留当前前缀和旧 reference 前缀，避免读取历史结果或旧错误文本时丢失诊断头。
     parts = [part.strip() for part in (message or '').split('\n\n')]  # 按空行切分多个前置诊断块与后续真实日志主体。
     diagnostic_parts = []  # 收集连续出现在最前面的诊断块。
     body_start = 0  # 记录真正日志主体从哪一块开始。

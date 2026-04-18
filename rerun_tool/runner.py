@@ -329,7 +329,10 @@ def _needs_seatunnel_shade_preinstall(repo_dir: str, entry: TestEntry, build_out
     output = build_output or ''  # 统一处理空日志场景。
     required_markers = ('seatunnel-config-shade', 'ConfigParser.java')  # 失败日志同时命中 shaded 模块和 ConfigParser 才是当前已确认的根因。
     missing_symbol_markers = ('AbstractConfigValue', 'ConfigNodeRoot', 'FullIncluder', 'ConfigIncludeContext', 'ConfigSyntax')  # 这些缺失符号都指向 shade 产物没有先生成。
-    return all(marker in output for marker in required_markers) and any(marker in output for marker in missing_symbol_markers)  # 仅在日志形态高度吻合时才触发预安装恢复。
+    if all(marker in output for marker in required_markers) and any(marker in output for marker in missing_symbol_markers):  # 历史 seatunnel shade 模块未 install 的老问题仍然继续保留。
+        return True
+    shaded_test_markers = ('org.apache.seatunnel.shade.', f'{os.sep}src{os.sep}test{os.sep}')  # v8 暴露出来的新症状是测试源码直接缺少 shaded 包。
+    return all(marker in output for marker in shaded_test_markers)  # 一旦命中 shaded 包缺失的测试编译错误，也说明需要先把目标 reactor install 到隔离仓库。
 
 
 def _run_maven_auxiliary_goal(repo_dir: str, entry: TestEntry, cmd_parts: list, timeout: int, use_docker: bool, docker_image: Optional[str]) -> Tuple[bool, str]:  # 执行一次不直接面向目标测试的辅助 Maven 命令。

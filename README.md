@@ -1010,3 +1010,193 @@ python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 5 --rer
 - 当前结果：`98 passed`
 
 这轮完成的是工具代码和README同步，还没有用“生成`v7.csv`的原始输入批次”在当前代码上重新全量重跑。所以现在不能直接声称`v7`里这`24%`已经被清零。下一步应该直接拿原始输入批次重跑，而不是继续用`v7.csv`当输入。
+
+## 第九轮复盘
+
+这一轮直接重新检查了`results/verify_patch_batch_build_run_failures_rerun1_v8.csv`，并生成了逐条诊断文件`results/verify_patch_batch_build_run_failures_rerun1_v8_diagnosis.csv`。`v8`里共有`84`条`build_failed`。其中真正还属于工具侧可修上下文问题的，集中在`graylog2-server`、`seatunnel`、`apollo`、`pulsar`、`adyen-java-api-library`、`cloudstack`、`nutz`、`nifi`和部分`mybatis-3`、`Gaffer`样本。
+
+### `v8`里剩余失败的结构
+
+这`84`条在`v8_diagnosis.csv`里被归成下面几类：
+
+- `fixed_sha_helper_search_gap` `20`条
+  典型是`graylog2-server`和`incubator-streampipes`。日志已经明确缺的是测试helper，但旧版`fixed_sha`检索只看目标文件、同目录和模块前缀，漏掉了嵌套模块或更大范围的测试树。
+- `patch_invalid_source` `14`条
+  典型是`JSON-java`。这些样本的`generated_patch`本身就不是合法Java源码，继续补`import`、`dependency`或helper都不会变成可编译。
+- `non_target_shaded_context_gap` `10`条
+  典型是`seatunnel`。问题不在目标测试本身，而在模块里其他测试文件依赖`org.apache.seatunnel.shade.*`类型。旧版既没有优先复用仓库里已有的shaded import，也不会处理非目标测试文件。
+- `patch_local_context_removed` `10`条
+  典型是`shenyu`和两条`mybatis-3`。补丁本身删掉了局部变量或后续还在使用旧变量名，失败来自补丁内部上下文丢失。
+- `dependency_scope_gap` `8`条
+  典型是`apollo`。补丁触发的是主源码对Guava的依赖缺口，但旧版工具把依赖写成了`test` scope，结果`src/main/java`还是编不过。
+- `patch_api_mismatch` `6`条
+  典型是`jinjava`、`fastjson`、`crane4j`。这些补丁调用的API形态在当前`original_sha`下就是不成立的，不能靠补上下文强行变成可编译。
+- `helper_insert_location_bug` `6`条
+  典型是`cloudstack`和`nutz`。helper已经从`fixed_sha`找到，但旧版成员插入点扫描不稳，把成员插进了错误的大括号层级，直接把源文件结构插坏。
+- `generated_patch_static_import_gap` `2`条
+  典型是`Gaffer`。老版本编译器没有完整打印symbol细节，旧版工具也不会直接从补丁正文识别`assertThat(...)`这类静态导入需求。
+- `qualified_helper_owner_gap` `2`条
+  典型是`pulsar`。补丁是`JSONSchemaTest.assertJSONEqual(...)`这种限定静态调用，旧版虽然找到了helper，却回补到了当前目标测试类，而不是owner类文件。
+- `generated_patch_context_gap` `2`条
+  典型是两条`mybatis-3`。补丁正文里已经明显出现了`when(...)`、`then(...)`、`caughtException()`这类三方上下文信号，但旧版没有从补丁正文推断出正确的static import和依赖。
+- `conflicting_import_batch` `2`条
+  典型是`adyen-java-api-library`。同一轮上下文补齐同时带入了两个同名不同库的`JsonParser`导入，触发了`single-type-import`冲突。
+- `dependency_context_gap` `2`条
+  典型是`nifi`和一条`pulsar`。补丁依赖的第三方库在当前模块里确实缺失，但旧版工具没有把它识别成正确的依赖和import上下文。
+
+### 上一轮为什么没有真正解决这些问题
+
+前一轮方向没有错，但还有五个关键空洞没有补上：
+
+- `fixed_sha`检索范围仍然太窄
+  旧版还是按“目标文件 -> 同目录 -> 同模块固定`src/test/*`前缀”查helper。`graylog2-server`这类嵌套模块场景因此继续漏掉。
+- helper目标文件决策还是只会写当前测试类
+  对`ClassName.method(...)`这种限定静态调用，旧版不会把helper回补到owner类文件，`pulsar`因此继续失败。
+- 依赖注入还没有区分`test`和`compile`
+  `apollo`这类主源码本身也依赖Guava的项目，旧版上下文增强只会把依赖写成`test` scope。
+- 非目标测试文件仍然没人修
+  Maven的`test-compile -pl <module> -am`会把模块里的其他测试一起编译。`seatunnel`这类失败不是目标测试坏，而是别的测试文件还缺上下文，旧版工具完全跳过了这类文件。
+- 一次性导入冲突仍然会把已经找到的正确上下文修坏
+  即使helper和依赖都找到了，只要同一轮补了两个同名不同库的import，还是会被`single-type-import`打回去。
+
+### 这一轮代码上的具体修复
+
+- `patch.py`
+  新增了`MissingMethodReference`和更完整的缺失方法解析。现在不仅提取方法名，还会把编译器`location`指向的owner类一起拿出来，供后续决定helper真正该写回哪个文件。
+- `patch.py`
+  `fixed_sha`检索从“固定前缀列树”改成了“先列出revision下全部测试源码，再按目标文件、同包、同模块、仓库其他测试树做排序”。这直接对应`graylog2-server`这类嵌套模块helper漏检。
+- `patch.py`
+  helper回补改成支持多目标文件。对`JSONSchemaTest.assertJSONEqual(...)`这种限定静态调用，会把helper写回owner类文件，而不是当前目标测试类。
+- `patch.py`
+  新增了批量import按简单类名去冲突的收敛逻辑。当前批次里如果同时出现两个`JsonParser`，现在会先看当前文件和仓库证据，再看代码语义，只保留最可信的那个。
+- `patch.py`
+  `generated_patch`上下文增强现在能直接从补丁正文推断`assertThat(...)`、`when(...)`、`then(...)`、`caughtException()`这类static import需求，不再完全依赖编译器把symbol细节打印完整。
+- `patch.py`
+  依赖推断新增了`catch-exception`、`jettison`、`hadoop-common`，并给Guava增加了主源码使用检查。只要仓库`src/main/java`本身也用了`com.google.common.*`，就会把Guava提升为`compile` scope。
+- `patch.py`
+  新增了`fix_related_test_imports(...)`。当构建日志里报的是同模块其他测试文件缺import时，工具会对这些非目标测试文件做同样的保守修复。
+- `patch.py`
+  顶层类闭合大括号扫描和字符串剥离逻辑都补了Java text block处理，helper插入点现在不会再被`"""..."""`里的大括号带偏。
+- `runner.py`
+  `seatunnel`的特殊恢复条件从旧的`ConfigParser.java`单一路径，扩展到了更普遍的`org.apache.seatunnel.shade.*`测试编译失败场景。命中这类日志时，会先做一次目标reactor install，再回到原始`test-compile`。
+- `workflow.py`
+  主流程新增了“related test import repair”阶段。现在顺序是：目标测试自动修复 -> `generated_patch`自身上下文增强 -> 同模块非目标测试import修复 -> `fixed_sha` helper回补。
+- `results.py`
+  错误压缩时会保留`Related test import repair:`和`Fixed-SHA helper backport:`这类新的诊断头，后续CSV复盘不会再把这段历史截掉。
+
+### 和参考补丁库、`fixed_code`以及真实运行边界的关系
+
+这一轮继续保持了之前已经收口好的边界：
+
+- 运行时仍然不会读取参考补丁库
+- 运行时仍然不会把`fixed_code`当补丁使用
+- 运行时只会评估原始`generated_patch`
+- `fixed_sha`只用于回补同一PR里真正新增的测试侧上下文，并且只限`src/test/*`
+
+也就是说，这一轮新增的能力仍然是在“帮助原始补丁正确落到原始项目并拿到它本来需要的测试上下文”，不是把ground truth代码拿来替换被评估补丁。
+
+### 当前验证状态
+
+- 逐条诊断文件已生成：`results/verify_patch_batch_build_run_failures_rerun1_v8_diagnosis.csv`
+- 单元测试已通过：`python3 -m pytest tests -q`
+- 当前结果：`105 passed`
+
+这轮完成的是：
+
+- `v8`失败集逐条归因
+- 工具代码修复
+- README同步更新
+
+还没有拿“生成`v8.csv`的原始输入批次”在当前代码上重新全量重跑。所以现在不能直接声称`v8`里剩下的`20%`已经被清掉。下一步应该直接用当前代码重跑原始输入批次，看这轮修复实际吃掉了多少`graylog2-server`、`seatunnel`、`apollo`、`pulsar`和`adyen-java-api-library`这几类工具侧失败。 
+
+## 第十轮复盘
+
+这一轮重新检查了`results/verify_patch_batch_build_run_failures_rerun1_v9.csv`，并生成了逐条诊断文件`results/verify_patch_batch_build_run_failures_rerun1_v9_diagnosis.csv`。`v9`里共有`74`条`build_failed`。其中`59`条`original_rerun_consistency=1.0`，`15`条`0.0`。这说明`v9`里仍然有大头属于工具侧问题，但同时也已经有一部分失败清楚地落到了补丁本身。
+
+### `v9`里剩余失败的结构
+
+这`74`条在`v9_diagnosis.csv`里被归成下面几类：
+
+- `false_positive_catch_exception_context` `27`条
+  典型项目是`shenyu`、`cloudstack`、`dropwizard`、`mybatis-3`、`cloud-slang`、`shardingsphere`和`pulsar`。这些样本的补丁里并没有真正使用`catch-exception`库，而是出现了`mocked.when(...)`、`when(...).thenReturn(...)`或`assertThatJson(...).when(Option...)`这类成员调用。`v9`仍然把它们误判成了裸的`CatchException.when(...)`，于是平白向`pom.xml`里加了一个解析不到的`catch-exception:1.4.6`。
+- `fixed_sha_helper_backport_gap_or_stale_v9` `20`条
+  典型项目是`graylog2-server`和`nutz`。日志里报的是`assertJsonEqualsNonStrict(...)`缺失。这个helper并不是空想出来的，它真实存在于对应`fixed_sha`的测试代码里。这一轮我直接在本地工作树上对`graylog`样本做了单独复现，当前代码已经能把helper和相关依赖回补回来，所以`v9`里的这20条更像是当时运行代码还没吃到当前修复，或者`v9`结果本身是旧运行产物，不是当前工作树能力的真实上界。
+- `patch_invalid_source` `14`条
+  全部集中在`JSON-java`。这批补丁本身含有非法控制字符和非法表达式开始，属于直接无效的Java源码。这里不是环境、Docker或import的问题。
+- `patch_api_mismatch_assertj_method` `4`条
+  典型项目是`Gaffer`和`jinjava`。补丁使用的AssertJ断言API和`original_sha`里实际可用的AssertJ版本不一致，属于补丁语义不成立。
+- `top_level_pom_dependency_insertion_bug` `2`条
+  典型项目是`fastjson`。这里不是依赖本身错，而是旧版工具把新增依赖写进了`maven-compiler-plugin`的`<dependencies>`里，结果Maven直接把POM判成非法。
+- `generated_patch_json_context_gap` `2`条
+  典型项目是`incubator-streampipes`。补丁显式使用了`JSONObject`，但`v9`没有把它正确绑定到`org.json`的import和依赖。
+- `helper_json_parser_resolution_gap` `2`条
+  典型项目是`adyen-java-api-library`。`fixed_sha`回补出来的helper实际上需要Gson风格的`JsonParser`，但`v9`仍然按当前文件旧上下文把它解析成了Jackson的`JsonParser`。
+- `patch_api_mismatch_project_utility` `2`条
+  典型项目是`crane4j`。补丁调用了当前`original_sha`下并不存在的项目内工具方法，属于补丁本身和目标版本不兼容。
+- `checked_exception_line_targeting_gap` `1`条
+  典型项目是`nifi`。旧版checked exception修复只按请求里的目标测试方法名落`throws`，没有按真正报错的源文件行号定位具体方法。
+
+从这个分布看，`v9`里真正还应该继续优化的，是前面六类工具侧问题，共`54`条。剩下`20`条已经清楚地属于补丁本身无效或API不成立，不能靠继续补环境来“修活”。
+
+### 这次为什么前一轮还没有解决
+
+前一轮方向基本对，但还有四个根问题没有收干净：
+
+- `generated_patch`上下文推断对helper的识别太宽
+  旧逻辑只要看到`when(`、`then(`就会认为需要`catch-exception`。这在`Mockito`、`json-unit`和普通链式调用里都会产生大量假阳性。
+- `pom`依赖插入还只会找第一个`</dependencies>`
+  Maven项目里第一个`<dependencies>`经常在`plugin`下面。旧逻辑直接做字符串替换，结果把项目依赖塞进了插件依赖区。
+- 模糊JSON类型仍然只看当前文件，不看当前helper或补丁片段本身
+  `JsonParser`、`JSONObject`、`JSONException`这类符号在不同库之间都有歧义。旧逻辑主要靠当前文件已有import和仓库全局证据，忽略了当前helper正文更强的语义信号。
+- checked exception修复仍然只盯测试方法名
+  编译器已经给出了真正报错的文件和行号，但旧逻辑没有利用这一点，所以在同文件多方法场景下仍可能把`throws`加错地方。
+
+### 这一轮代码上的具体修复
+
+- `patch.py`
+  `catch-exception`的推断改成只接受裸的`when(...)`和`caughtException()`调用，不再因为`.when(...)`、`.thenReturn(...)`或`assertThatJson(...).when(...)`误加依赖。
+- `patch.py`
+  `jettison`的依赖推断改成只在代码里明确出现`org.codehaus.jettison.json`时才触发，不再让`JSONObject`、`JSONArray`、`JSONException`这种通用JSON名字误绑到`jettison`。
+- `patch.py`
+  `generated_patch`和`fixed_sha helper`的上下文推断补上了`JSONObject`、`JSONArray`，并且把它们默认绑定到`org.json`语境。
+- `patch.py`
+  `JsonParser`、`JSONObject`和`JSONException`的歧义解析现在会同时参考当前文件和当前helper/补丁片段。像`new JsonParser().parse(...).getAsJsonObject()`这类旧式Gson语义，不会再被当前文件里的其他Jackson线索带偏。
+- `patch.py`
+  `pom`依赖注入改成只定位`project`直系子节点里的`<dependencies>`。如果顶层还没有这个区块，就在`project`顶层新建，而不是再把依赖插进`plugin`或`dependencyManagement`内部。
+- `patch.py`
+  checked exception修复现在会优先读取编译器报错里的文件和行号，再回推真正出错的方法声明。它也兼容Docker日志里的`/workspace/...`路径，不再只认宿主机绝对路径。
+
+### 和`v9`结果的关系
+
+这一轮有一个需要明确写清的点：
+
+- `v9.csv`里的失败信息对根因分析仍然有价值
+- 但它并不完全等于当前工作树的真实失败上界
+
+至少`graylog2-server`和`nutz`这类`assertJsonEqualsNonStrict(...)`失败，我已经在当前工作树上单独验证过，`fixed_sha helper backport`链路现在能回补成功。所以这20条不应该再被继续归成“补丁本身坏了”，更合理的解释是`v9`运行时没有吃到当前工作树里的修复。
+
+### 这一轮新增回归测试
+
+- `mocked.when(...)`这类成员调用不会再误触发`catch-exception`
+- `JSONObject`会绑定到`org.json`，并且依赖会写到`project`顶层`<dependencies>`
+- 旧式Gson `new JsonParser().parse(...)` helper 也能解析到正确的Gson导入
+- checked exception修复会优先按报错行号定位真正的方法，而不是盲修请求里的测试方法
+
+### 当前验证状态
+
+- 逐条诊断文件已生成：`results/verify_patch_batch_build_run_failures_rerun1_v9_diagnosis.csv`
+- 单元测试已通过：`python3 -m pytest tests -q`
+- 当前结果：`109 passed`
+
+这轮完成的是：
+
+- `v9`失败集逐条归因
+- 工具代码修复
+- README同步更新
+
+还没有用“生成`v9.csv`的原始输入批次”在当前代码上重新全量重跑。所以现在不能直接声称`v9`里的`74`条失败已经被清到什么水平。比较稳妥的判断是：
+
+- 当前代码已经继续吃掉了`catch-exception`假阳性、`pom`插错层级、`JSONObject/JsonParser`歧义和checked exception定位这四类工具侧问题
+- `JSON-java`、`jinjava`、`Gaffer`、`crane4j`里那批补丁自身无效或API不成立的样本，仍然不会因为继续修工具就全部转成可编译
+
+下一步应该直接用当前代码重跑原始输入批次，再看`v9`这`74`条里还有多少是真正剩下的工具侧失败。 
