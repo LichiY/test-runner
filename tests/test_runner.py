@@ -3,9 +3,10 @@ import unittest  # 导入标准库测试框架。
 from pathlib import Path  # 导入路径工具简化测试文件创建。
 from unittest import mock  # 导入 mock 以便隔离外部依赖。
 
-from rerun_tool.data import TestEntry  # 导入数据结构构造最小测试样本。
+from rerun_tool.data import RunnerBackend, TestEntry  # 导入数据结构构造最小测试样本。
 from rerun_tool.runner import (ExecutionEnvironment, _maven_stability_flags, _parse_test_result,  # 导入待测的结果判定和 Maven 降噪参数函数。
-                               build_project)  # 导入构建入口以验证项目级恢复逻辑。
+                               _nondex_batch_timeout, _run_maven_nondex_batch_with_summary, build_project,
+                               run_test_with_summary)  # 导入构建入口与 NonDex 批量执行入口以验证关键行为。
 
 
 def _make_entry(project_name: str = 'demo', module: str = '.') -> TestEntry:  # 创建用于测试的最小数据样本。
@@ -63,6 +64,8 @@ class RunnerBehaviorTests(unittest.TestCase):  # 覆盖结果判定与 Maven 构
         self.assertIn('-Dfmt.skip=true', flags)  # 断言 fmt-maven-plugin 的检查会被跳过。
         self.assertIn('-Dimpsort.skip=true', flags)  # 断言 impsort-maven-plugin 的检查会被跳过。
         self.assertIn('-Dformatter.skip=true', flags)  # 断言 formatter-maven-plugin 的检查会被跳过。
+        self.assertIn('-DskipCheckstyle=true', flags)  # 断言常见的 Checkstyle 别名开关也会被统一补上。
+        self.assertIn('-Dspring-javaformat.skip=true', flags)  # 断言 Spring Java Format 一类前置格式检查也会被跳过。
 
     def test_build_project_adds_os_classifier_override_for_os_maven_projects(self):  # 验证依赖 `${os.detected.classifier}` 的仓库会自动追加稳定的 Linux classifier。
         with tempfile.TemporaryDirectory() as tmp_dir:  # 创建隔离的临时仓库目录。
@@ -101,6 +104,88 @@ class RunnerBehaviorTests(unittest.TestCase):  # 覆盖结果判定与 Maven 构
         cmd_parts = mocked_aux.call_args.kwargs['cmd_parts']  # 读取传给辅助 Maven 命令的参数列表。
         self.assertIn('install', cmd_parts)  # 断言恢复命令会把目标 reactor install 到隔离仓库。
         self.assertEqual(cmd_parts[-3:], ['-pl', 'seatunnel-api', '-am'])  # 断言恢复范围是目标模块及其上游依赖，而不是只装单个 shade 模块。
+
+    def test_run_maven_nondex_batch_with_summary_recovers_internal_run_results(self):  # 验证 NonDex 批量实验会从 manifest 和 surefire XML 恢复完整结果序列。
+        with tempfile.TemporaryDirectory() as tmp_dir:  # 创建隔离的临时仓库目录。
+            repo_dir = Path(tmp_dir)  # 将字符串路径包装为 Path。
+            (repo_dir / 'pom.xml').write_text('<project/>', encoding='utf-8')  # 写入最小 pom 以触发 Maven 路径。
+            entry = _make_entry(project_name='fastjson')  # 构造一个最小 Maven 测试条目。
+
+            def _write_report(run_dir: Path, failures: int) -> None:  # 写入最小 surefire XML 报告。
+                run_dir.mkdir(parents=True, exist_ok=True)  # 确保当前 run 目录存在。
+                (run_dir / f'TEST-{entry.test_class}.xml').write_text(  # 写入最小 surefire XML。
+                    f'<?xml version="1.0" encoding="UTF-8"?><testsuite name="{entry.test_class}" tests="1" failures="{failures}" errors="0" skipped="0" time="0.010"></testsuite>',
+                    encoding='utf-8',
+                )  # 完成报告写入。
+
+            def fake_subprocess_run(*args, **kwargs):  # 在命令真正执行前伪造 NonDex 输出目录与结果文件。
+                nondex_dir = repo_dir / '.nondex'  # 定位当前仓库的 `.nondex` 目录。
+                nondex_dir.mkdir(parents=True, exist_ok=True)  # 创建 `.nondex` 目录。
+                (nondex_dir / 'seed1.run').write_text('seed1\nseed2\nclean_seed1\n', encoding='utf-8')  # 写入本次批次 manifest，刻意把 clean 放在最后以验证重排逻辑。
+                _write_report(nondex_dir / 'seed1', failures=1)  # 第一轮扰动失败。
+                _write_report(nondex_dir / 'seed2', failures=0)  # 第二轮扰动通过。
+                _write_report(nondex_dir / 'clean_seed1', failures=0)  # clean 基线通过。
+                return mock.Mock(returncode=0, stdout='[INFO] [NonDex] The id of this run is: seed1\n', stderr='')  # 返回带首个 run id 的最小 NonDex 输出。
+
+            with mock.patch('rerun_tool.runner.subprocess.run', side_effect=fake_subprocess_run), mock.patch('rerun_tool.runner.time.perf_counter', side_effect=[10.0, 13.0]):  # 固定命令执行与壁钟时间。
+                summary = _run_maven_nondex_batch_with_summary(str(repo_dir), entry, total_runs=3, timeout=30, use_docker=False, docker_image=None)  # 调用待测的批量 NonDex 执行入口。
+        self.assertEqual(summary.results, ['pass', 'fail', 'pass'])  # 断言 clean 基线被放到最前，其余扰动结果顺序保持不变。
+        self.assertAlmostEqual(summary.rerun_elapsed_seconds, 3.0)  # 断言整批实验壁钟耗时被正确记录。
+        self.assertEqual(summary.checkpoint_rerun_elapsed_seconds, {3: 3.0})  # 断言小样本场景只记录最终阶段耗时。
+
+    def test_run_maven_nondex_batch_with_summary_falls_back_to_output_when_manifest_reports_are_missing(self):  # 验证 `.nondex` 目录缺失时也能从命令输出恢复批量结果，避免整批误判成 RUN_ERROR。
+        with tempfile.TemporaryDirectory() as tmp_dir:  # 创建隔离的临时仓库目录。
+            repo_dir = Path(tmp_dir)  # 将字符串路径包装为 Path。
+            (repo_dir / 'pom.xml').write_text('<project/>', encoding='utf-8')  # 写入最小 pom 以触发 Maven 路径。
+            entry = _make_entry(project_name='jetcache')  # 构造一个最小 Maven 测试条目。
+            output = (
+                '[INFO] Running com.example.SampleTest\n'
+                '[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0\n'
+                'CONFIG: nondexFilter=.*\n'
+                'nondexExecid=seed1\n'
+                'Running com.example.SampleTest\n'
+                'Tests run: 1, Failures: 0, Errors: 0, Skipped: 0\n'
+                'CONFIG: nondexFilter=.*\n'
+                'nondexExecid=seed2\n'
+                'Running com.example.SampleTest\n'
+                'Tests run: 1, Failures: 1, Errors: 0, Skipped: 0\n'
+            )  # 构造 manifest 缺失但标准输出仍保留每轮测试摘要的 NonDex 批量日志。
+            with mock.patch('rerun_tool.runner.subprocess.run', return_value=mock.Mock(returncode=0, stdout=output, stderr='')), mock.patch('rerun_tool.runner.time.perf_counter', side_effect=[10.0, 14.0]):  # 伪造 NonDex 执行和壁钟时间。
+                summary = _run_maven_nondex_batch_with_summary(str(repo_dir), entry, total_runs=3, timeout=30, use_docker=False, docker_image=None)  # 调用待测的批量 NonDex 执行入口。
+        self.assertEqual(summary.results, ['pass', 'pass', 'fail'])  # 断言当前会从输出中恢复出 clean baseline 和两轮扰动结果。
+        self.assertAlmostEqual(summary.rerun_elapsed_seconds, 4.0)  # 断言输出恢复场景仍会正确记录整批壁钟耗时。
+        self.assertEqual(summary.error_outputs, [])  # 断言没有基础设施 error 时不会错误写入 RUN_ERROR 诊断。
+
+    def test_run_maven_nondex_batch_with_summary_scales_timeout_and_keeps_project_flags(self):  # 验证批量 NonDex 会按 rerun 次数放宽超时，并保留项目特定系统属性。
+        with tempfile.TemporaryDirectory() as tmp_dir:  # 创建隔离的临时仓库目录。
+            repo_dir = Path(tmp_dir)  # 将字符串路径包装为 Path。
+            (repo_dir / 'pom.xml').write_text(  # 写入一个显式依赖 os classifier 的最小 pom。
+                '<project>'
+                '<build><extensions><extension><groupId>kr.motd.maven</groupId><artifactId>os-maven-plugin</artifactId></extension></extensions></build>'
+                '<dependencies><dependency><groupId>io.netty</groupId><artifactId>netty-tcnative</artifactId><classifier>${os.detected.classifier}</classifier></dependency></dependencies>'
+                '</project>',
+                encoding='utf-8',
+            )  # 完成最小 pom 写入。
+            entry = _make_entry(project_name='timely', module='server')  # 构造一个最小 Maven 测试条目。
+            with mock.patch('rerun_tool.runner.platform.machine', return_value='x86_64'), mock.patch('rerun_tool.runner.subprocess.run', return_value=mock.Mock(returncode=0, stdout='[INFO] [NonDex] The id of this run is: seed1\n', stderr='')) as mocked_run, mock.patch('rerun_tool.runner.time.perf_counter', side_effect=[10.0, 12.0]):  # 固定当前平台架构、拦截 Maven 命令并冻结壁钟时间。
+                summary = _run_maven_nondex_batch_with_summary(str(repo_dir), entry, total_runs=50, timeout=300, use_docker=False, docker_image=None)  # 调用批量 NonDex 执行入口。
+        self.assertEqual(summary.results, ['pass'] * 50)  # manifest 和输出都无法恢复时会退回到单条输出解析，此时应被扩展成 50 个 pass。
+        self.assertEqual(mocked_run.call_args.kwargs['timeout'], 1800)  # 断言 50 轮批量扰动会把整体超时预算提升到 6 倍。
+        self.assertIn('-Dos.detected.classifier=linux-x86_64', mocked_run.call_args.args[0])  # 断言批量 NonDex 命令同样会继承项目特定系统属性。
+
+    def test_nondex_batch_timeout_caps_multiplier(self):  # 验证批量 NonDex 超时预算会按 10 轮一档放大，并在极端大批次时封顶。
+        self.assertEqual(_nondex_batch_timeout(300, 1), 300)  # 单轮 clean baseline 不需要额外放大超时。
+        self.assertEqual(_nondex_batch_timeout(300, 20), 600)  # 20 轮批量实验放大到 2 倍。
+        self.assertEqual(_nondex_batch_timeout(300, 50), 1800)  # 50 轮批量实验放大到 6 倍上限。
+
+    def test_run_test_with_summary_uses_single_nondex_batch_for_maven(self):  # 验证主入口在 NonDex 模式下会走一次批量实验而不是外层循环单跑。
+        entry = _make_entry(project_name='fastjson')  # 构造一个最小 Maven 测试条目。
+        execution_env = ExecutionEnvironment(build_tool='maven', use_docker=False)  # 固定当前测试走本地 Maven 分支。
+        expected_summary = mock.Mock(results=['pass', 'fail', 'pass'], rerun_elapsed_seconds=2.5, checkpoint_rerun_elapsed_seconds={3: 2.5}, error_outputs=[])  # 构造一个最小批量执行摘要。
+        with mock.patch('rerun_tool.runner._run_maven_nondex_batch_with_summary', return_value=expected_summary) as mocked_batch:  # 拦截实际的 NonDex 批量执行逻辑。
+            summary = run_test_with_summary(repo_dir='/tmp/demo', entry=entry, rerun_count=3, mode=mock.Mock(), use_docker=False, timeout=30, runner_backend=RunnerBackend.NONDEX, execution_env=execution_env)  # 调用统一执行入口。
+        self.assertIs(summary, expected_summary)  # 断言主入口直接返回批量执行摘要。
+        mocked_batch.assert_called_once_with(repo_dir='/tmp/demo', entry=entry, total_runs=3, timeout=30, use_docker=False, docker_image=None)  # 断言当前只会发起一次批量 NonDex 实验。
 
 
 if __name__ == '__main__':  # 允许单文件直接运行测试。

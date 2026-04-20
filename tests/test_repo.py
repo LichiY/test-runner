@@ -5,7 +5,7 @@ from pathlib import Path  # 导入路径工具简化测试目录创建。
 from unittest import mock  # 导入 mock 以便隔离真实 Git 命令执行。
 
 from rerun_tool.repo import (_run_git, clone_repo, ensure_revision_available,  # 导入待测的 Git 准备入口函数与底层 Git 执行器。
-                             list_files_at_revision, read_file_at_revision)  # 导入 fixed_sha 辅助读取函数。
+                             list_files_at_revision, read_file_at_revision, _remove_workspace)  # 导入 fixed_sha 辅助读取函数与工作区清理 helper。
 
 
 class RepoBehaviorTests(unittest.TestCase):  # 测试 Git clone、fetch 与 checkout 加固逻辑。
@@ -114,6 +114,17 @@ class RepoBehaviorTests(unittest.TestCase):  # 测试 Git clone、fetch 与 chec
         self.assertTrue(ok)  # 断言当前读取流程成功。
         self.assertEqual(content, 'class ExampleTest {}\n')  # 断言返回内容来自 git show 标准输出。
         self.assertEqual(mocked_git.call_args.args[1], ['git', 'show', f'{"c" * 40}:src/test/java/com/example/ExampleTest.java'])  # 断言不会通过 checkout 改写工作树。
+
+    def test_remove_workspace_retries_after_docker_permission_repair(self):  # 验证工作区删除命中权限错误时会先做 Docker 权限修复再重试删除。
+        with tempfile.TemporaryDirectory() as tmp_dir:  # 创建隔离的临时目录。
+            target_dir = Path(tmp_dir) / 'demo'  # 构造工作区目录路径。
+            target_dir.mkdir()  # 创建最小工作区目录。
+            with mock.patch('rerun_tool.repo.shutil.rmtree', side_effect=[PermissionError('denied'), None]) as mocked_rmtree, mock.patch('rerun_tool.repo._repair_workspace_permissions_with_docker', return_value=(True, 'repaired')) as mocked_repair:  # 让第一次删除失败、权限修复成功、第二次删除成功。
+                ok, message = _remove_workspace(str(target_dir))  # 执行工作区清理 helper。
+        self.assertTrue(ok)  # 断言权限修复后当前工作区可以被删除。
+        self.assertIn('after permission repair', message)  # 断言返回消息会明确说明删除成功来自权限修复后的重试。
+        self.assertEqual(mocked_rmtree.call_count, 2)  # 断言当前会在权限修复前后各尝试一次删除。
+        mocked_repair.assert_called_once_with(str(target_dir))  # 断言确实进入了 Docker 权限修复分支。
 
 
 if __name__ == '__main__':  # 允许单文件直接运行测试。

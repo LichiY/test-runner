@@ -4,6 +4,7 @@ from dataclasses import dataclass  # 导入数据类装饰器以结构化返回 
 import logging  # 导入日志模块记录 Git 准备过程中的关键阶段。
 import os  # 导入路径工具判断工作区与仓库状态。
 import shutil  # 导入目录清理工具修复残缺工作区。
+import stat  # 导入权限常量以修复只读或容器残留目录的删除失败。
 import subprocess  # 导入子进程工具执行 Git 命令。
 import time  # 导入时间工具实现有限退避重试。
 from typing import Optional, Tuple  # 导入可选类型注解工具。
@@ -15,6 +16,7 @@ PARTIAL_CLONE_FLAGS = ['--filter=blob:none', '--no-checkout']  # 优先使用 pa
 FALLBACK_CLONE_FLAGS = ['--no-checkout']  # 当远端不支持 partial clone 时回退到普通 no-checkout clone。
 PARTIAL_FETCH_FLAGS = ['--tags', '--prune', '--filter=blob:none', 'origin']  # 对已有仓库的 fetch 同样优先走轻量拉取。
 FALLBACK_FETCH_FLAGS = ['--tags', '--prune', 'origin']  # 当远端不支持过滤 fetch 时再回退到普通 fetch。
+WORKSPACE_PERMISSION_REPAIR_IMAGE = 'maven:3.8.6-openjdk-11'  # 复用已知存在 `/bin/sh` 的 Maven 镜像修复 Docker 残留的 root 所有权。
 
 
 @dataclass  # 定义 Git 准备阶段的结构化返回结果。
@@ -234,14 +236,68 @@ def _has_valid_git_repo(target_dir: str) -> bool:  # 判断目标目录是否包
 
 def _remove_workspace(target_dir: str) -> tuple[bool, str]:  # 删除残缺工作区或损坏仓库目录。
     try:  # 捕获删除目录或文件时的异常。
-        if os.path.isdir(target_dir) and not os.path.islink(target_dir):  # 普通目录需要递归删除。
-            shutil.rmtree(target_dir)  # 删除整个目录树。
-        elif os.path.exists(target_dir):  # 其余文件或符号链接按单文件删除。
-            os.remove(target_dir)  # 删除单个路径节点。
+        _delete_workspace_path(target_dir)  # 先按本地权限直接删除，优先覆盖普通只读文件场景。
         return True, f"Removed workspace {target_dir}"  # 返回删除成功消息。
-    except Exception as e:  # 捕获删除过程中的异常。
+    except PermissionError as e:  # Docker 挂载留下的 root:root 目录最常见，会在这里先命中。
+        logger.warning(f"Workspace removal hit permission error for {target_dir}, attempting permission repair: {e}")  # 记录即将进入权限修复分支。
+        repaired, repair_message = _repair_workspace_permissions_with_docker(target_dir)  # 用 Docker root 用户把 bind mount 下的文件所有权还给宿主机用户。
+        if repaired:  # 权限修复成功后再重试一次真正的删除。
+            try:
+                _delete_workspace_path(target_dir)  # 权限修复后再次尝试删除目录树。
+                return True, f"Removed workspace {target_dir} after permission repair"  # 返回“已修复再删除成功”的明确诊断。
+            except Exception as retry_error:  # 权限修复成功但删除仍失败时保留重试后的真实异常。
+                logger.error(f"Failed to remove workspace {target_dir} after permission repair: {retry_error}")  # 记录重试删除仍失败的原因。
+                return False, f"Failed to remove workspace {target_dir} after permission repair: {retry_error}"  # 返回更准确的删除失败消息。
+        logger.error(f"Failed to remove workspace {target_dir}: {e} | repair: {repair_message}")  # 记录权限修复本身失败的原因。
+        return False, f"Failed to remove workspace {target_dir}: {e} | {repair_message}"  # 返回包含权限修复结果的失败消息。
+    except Exception as e:  # 捕获其余删除过程中的异常。
         logger.error(f"Failed to remove workspace {target_dir}: {e}")  # 记录工作区删除失败原因。
         return False, f"Failed to remove workspace {target_dir}: {e}"  # 返回工作区删除失败消息。
+
+
+def _delete_workspace_path(target_dir: str) -> None:  # 按路径类型删除工作区，并在只读文件场景下尝试本地 chmod 后重试。
+    if os.path.isdir(target_dir) and not os.path.islink(target_dir):  # 普通目录需要递归删除。
+        shutil.rmtree(target_dir, onerror=_retry_remove_with_local_chmod)  # 本地先覆盖只读目录，再把真正的 root 权限问题交给上层处理。
+        return  # 目录路径删除完成后结束。
+    if os.path.exists(target_dir):  # 其余文件或符号链接按单文件删除。
+        os.remove(target_dir)  # 删除单个路径节点。
+
+
+def _retry_remove_with_local_chmod(func, path: str, exc_info) -> None:  # 在 `shutil.rmtree` 删除只读文件失败时先本地加写权限再重试。
+    try:  # 当前 helper 只处理宿主机用户本身有权修改权限的路径。
+        mode = os.stat(path).st_mode  # 读取当前路径的权限位。
+        os.chmod(path, mode | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)  # 为宿主机用户补齐最小删除权限。
+        func(path)  # 直接重试原始删除动作。
+    except Exception:  # 若仍然失败，则把原始异常继续抛给上层统一处理。
+        raise exc_info[1]
+
+
+def _repair_workspace_permissions_with_docker(target_dir: str, timeout: int = 180) -> tuple[bool, str]:  # 用一次临时 Docker 容器修复 bind mount 下的 root 所有权残留。
+    normalized_target_dir = os.path.abspath(target_dir)  # 统一转为绝对路径，避免 Docker 绑定挂载路径歧义。
+    if not os.path.exists(normalized_target_dir):  # 路径已经不存在时无需再修。
+        return True, f"Workspace {normalized_target_dir} already absent"  # 直接返回成功，避免多余 Docker 调用。
+    if shutil.which('docker') is None:  # 未安装 Docker CLI 时无法自动修复容器残留权限。
+        return False, 'Docker CLI is unavailable for workspace permission repair'  # 返回明确失败原因供结果 CSV 诊断。
+    host_uid = os.getuid()  # 当前宿主机用户 UID，将其作为最终目标所有者。
+    host_gid = os.getgid()  # 当前宿主机用户 GID，将其作为最终目标组。
+    repair_script = (  # 先 chown，再补齐用户删除目录所需的读写执行权限。
+        f'chown -R {host_uid}:{host_gid} /workspace >/dev/null 2>&1 || true; '
+        'chmod -R u+rwX /workspace >/dev/null 2>&1 || true'
+    )  # 失败时仍让脚本继续返回，最终以 Docker 退出码和输出统一判断。
+    repair_cmd = [  # 用一次临时容器完成权限修复，不污染目标工作区的 Git 状态。
+        'docker', 'run', '--rm',
+        '-v', f'{normalized_target_dir}:/workspace',
+        '--entrypoint', '/bin/sh',
+        WORKSPACE_PERMISSION_REPAIR_IMAGE,
+        '-lc', repair_script,
+    ]  # 结束临时 Docker 修复命令构造。
+    try:  # 捕获 Docker 调用本身的异常与超时。
+        repair_result = subprocess.run(repair_cmd, capture_output=True, text=True, timeout=timeout)  # 执行权限修复容器。
+    except Exception as e:  # Docker 守护进程不可用或命令超时时都会落到这里。
+        return False, f"Docker workspace permission repair failed: {e}"  # 将异常包装成可直接写入结果文件的诊断。
+    if repair_result.returncode != 0:  # Docker 修复命令非零返回时需要把尾部输出暴露给上层。
+        return False, f"Docker workspace permission repair failed: {_combined_output(repair_result) or 'No docker output captured'}"  # 返回压缩后的 Docker 错误输出。
+    return True, f"Repaired workspace permissions for {normalized_target_dir} via Docker"  # 返回成功消息供 clone 诊断链路记录。
 
 
 def _success_message(reused_existing_repo: bool, repaired_workspace: bool) -> str:  # 根据当前路径选择成功诊断文本。

@@ -149,7 +149,91 @@ python3 -m rerun_tool detect-flaky --repo-url https://github.com/SAP/emobility-s
 - 不能自动修复补丁相关的编译问题，因为本模式本来就不应该改源码
 - 只能观测 flaky 行为，不能回答“补丁是否修好”
 
-## 执行后端
+## 推荐CLI语义
+
+当前推荐把命令行理解成两层：
+
+- 第一层是`测试类型`
+  说明你认为当前样本更像哪一类 flaky test。
+- 第二层是`执行策略`
+  说明工具应该如何设计 rerun 实验去暴露这种 flakiness。
+
+实际使用时，优先使用：
+
+- `--flaky-type`
+- `--profile`
+
+只有在调试底层实现时，才直接使用隐藏的高级兼容参数：
+
+- `--runner`
+- `--mode`
+
+### 类型和默认策略的对应关系
+
+| flaky类型 | 含义 | 默认profile | 当前实现 |
+| --- | --- | --- | --- |
+| `unknown` | 类型未知，只做基线验证 | `baseline` | 原生隔离式rerun |
+| `id` | implementation-dependent | `impl_perturb` | 显式外部后端`NonDex` |
+| `nio` | non-idempotent-outcome | `same_env` | 原生`same_jvm`连续复跑 |
+| `od` | order-dependent | `order_perturb` | 语义已建模，当前尚未实现真正顺序扰动后端 |
+| `nod` | non-order-dependent上位类 | 无法自动决定 | 需要你细化成`id`或`nio`，或者手工指定`--profile` |
+
+说明：
+
+- `ID`通常可以视为`NOD`里的一个子类，但`NOD`太粗，不能直接决定 rerun 方式。
+- 这也是为什么现在 CLI 不再鼓励直接从`--runner standard/nondex`开始，而是先选`--flaky-type`。
+
+### 什么叫扰动
+
+这里的“扰动”不是无条件加大重跑次数，而是：
+
+- 固定代码版本
+- 固定目标测试
+- 有控制地改变执行条件或未指定语义的实现行为
+- 再重复执行，观察结果是否发生变化
+
+当前工具里已经明确建模了三种 rerun 语义：
+
+- `baseline`
+  同一代码、同一目标测试、隔离式重复执行，适合作为干净基线。
+- `same_env`
+  同一环境内连续执行，适合发现状态累积、缓存残留、单例污染这类`NIO`问题。
+- `impl_perturb`
+  在不改业务代码的前提下，扰动未指定实现细节后重复执行，适合发现`ID`问题。当前由`NonDex`承担。
+
+`order_perturb`已经进入语义层，但当前仓库还没有真正实现完整的顺序扰动后端，所以如果选择`OD`，CLI会明确报错，而不是静默退回错误的跑法。
+
+### 推荐命令
+
+基线检测：
+
+```bash
+python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --flaky-type unknown --rerun 20 --docker auto -o results/flaky_baseline.csv
+```
+
+`NIO`检测：
+
+```bash
+python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --flaky-type nio --rerun 20 --docker auto -o results/flaky_nio.csv
+```
+
+`ID`检测：
+
+```bash
+python3 -m rerun_tool detect-flaky-external nondex --csv flaky_inputs.csv --flaky-type id --rerun 20 --docker auto -o results/flaky_id_nondex.csv
+```
+
+补丁验证也遵循同一套语义层接口：
+
+```bash
+python3 -m rerun_tool verify-patch --csv patch-data/cleaned_mutation_data.csv --flaky-type id --rerun 20 --docker auto -o results/verify_patch_id.csv
+```
+
+如果你明确知道自己在调试底层实现细节，仍然可以继续使用旧的`--runner`和`--mode`。但从现在开始，它们属于兼容入口，不再是主文档推荐接口。
+
+## 底层执行后端
+
+这一节描述实现层，而不是推荐的用户入口。正常使用请优先看上面的`--flaky-type`和`--profile`。
 
 ### `--runner standard`
 
@@ -328,14 +412,26 @@ python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --runner nondex --reru
   每次重跑的结果数组，格式类似 `["pass", "fail", "pass"]`
 - `pass_count` / `fail_count` / `error_count`
   统计信息
+- `clone_elapsed_seconds`
+  克隆与检出阶段耗时
+- `prepare_elapsed_seconds`
+  工作区准备阶段耗时。对`verify-patch`来说主要是补丁应用和测试文件定位；对`detect-flaky`来说通常接近`0`
+- `build_elapsed_seconds`
+  项目构建阶段耗时
+- `pre_rerun_elapsed_seconds`
+  从开始处理该条样本到真正进入rerun之前的累计耗时。这个值等于`clone + prepare + build`
+- `end_to_end_elapsed_seconds`
+  `total_elapsed_seconds`的显式别名，强调这是包含构建阶段的端到端耗时
 - `total_elapsed_seconds`
   从开始处理该条样本到结束的总耗时，包含克隆、依赖下载、构建、补丁应用和 rerun
 - `rerun_elapsed_seconds`
   纯 rerun 阶段的总耗时，不包含克隆、下载和构建
 - `checkpoint_<N>_verdict`
   前 `N` 次 rerun 的阶段性 verdict
+- `checkpoint_<N>_end_to_end_elapsed_seconds`
+  到第`N`次rerun为止的端到端耗时，显式包含克隆、准备和构建
 - `checkpoint_<N>_total_elapsed_seconds`
-  从该条样本开始处理到完成第 `N` 次 rerun 的总耗时
+  从该条样本开始处理到完成第 `N` 次 rerun 的总耗时。它和`checkpoint_<N>_end_to_end_elapsed_seconds`是同一个值，保留两列只是为了兼容旧分析脚本
 - `checkpoint_<N>_rerun_elapsed_seconds`
   从开始 rerun 到完成第 `N` 次 rerun 的纯 rerun 耗时
 - `verdict`
@@ -711,6 +807,11 @@ python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --rerun 50 --runner st
 
 以及对应的：
 
+- `checkpoint_10_end_to_end_elapsed_seconds`
+- `checkpoint_20_end_to_end_elapsed_seconds`
+- `checkpoint_30_end_to_end_elapsed_seconds`
+- `checkpoint_40_end_to_end_elapsed_seconds`
+- `checkpoint_50_end_to_end_elapsed_seconds`
 - `checkpoint_10_total_elapsed_seconds` / `checkpoint_10_rerun_elapsed_seconds`
 - `checkpoint_20_total_elapsed_seconds` / `checkpoint_20_rerun_elapsed_seconds`
 - `checkpoint_30_total_elapsed_seconds` / `checkpoint_30_rerun_elapsed_seconds`
@@ -734,12 +835,26 @@ python3 -m rerun_tool detect-flaky --csv flaky_inputs.csv --rerun 50 --runner st
 - `total_elapsed_seconds`
 - `rerun_elapsed_seconds`
 
+如果你想把这件事看得更细，可以再看：
+
+- `clone_elapsed_seconds`
+- `prepare_elapsed_seconds`
+- `build_elapsed_seconds`
+- `pre_rerun_elapsed_seconds`
+
 如果：
 
 - `total_elapsed_seconds` 远大于 `rerun_elapsed_seconds`
   说明主要时间花在克隆、依赖下载、构建或补丁应用
 - 两者差距不大
   说明主要时间花在真正的 rerun 阶段
+
+如果：
+
+- `pre_rerun_elapsed_seconds` 很大
+  说明瓶颈主要在进入rerun之前，通常是构建或补丁应用
+- `build_elapsed_seconds` 占`pre_rerun_elapsed_seconds`的大头
+  说明真正拖慢实验的是项目构建，不是重复执行本身
 
 权衡：
 
@@ -1200,3 +1315,491 @@ python3 -m rerun_tool --csv patch-data/cleaned_mutation_data.csv --limit 5 --rer
 - `JSON-java`、`jinjava`、`Gaffer`、`crane4j`里那批补丁自身无效或API不成立的样本，仍然不会因为继续修工具就全部转成可编译
 
 下一步应该直接用当前代码重跑原始输入批次，再看`v9`这`74`条里还有多少是真正剩下的工具侧失败。 
+
+## 第十一轮复盘
+
+这一轮重新检查了`results/verify_patch_batch_build_run_failures_rerun1_v10.csv`，并生成了逐条诊断文件`results/verify_patch_batch_build_run_failures_rerun1_v10_diagnosis.csv`。`v10`里共有`64`条`build_failed`。其中`49`条`original_rerun_consistency=1.0`，`15`条`0.0`。这说明`v10`里仍然主要是工具侧问题，但已经收缩成很少几类稳定模式，不再像前几轮那样散。
+
+### `v10`里剩余失败的结构
+
+这`64`条在`v10_diagnosis.csv`里被归成下面九类：
+
+- `mockito_when_context_misresolved` `18`条
+  典型项目是`shenyu`、`shardingsphere`、`dropwizard`、`cloud-slang`和`mybatis-3`。补丁里出现的是`when(...).thenReturn(...)`这类Mockito stub，但旧逻辑只看到了裸`when(...)`，于是误补了`CatchException.when`和`catch-exception`依赖。
+- `fixed_sha_helper_backport_stale_v10` `18`条
+  全部集中在`graylog2-server`。报错还是`assertJsonEqualsNonStrict(...)`缺失，但我在当前工作树上单独复现后，`fixed_sha`回补已经能成功。这一批更像`v10`运行时没有吃到当前代码，而不是当前代码还不会修。
+- `patch_invalid_source` `14`条
+  全部集中在`JSON-java`。补丁本身就是非法Java源码，继续补import、pom或helper都不会变成可编译。
+- `checked_exception_line_drift` `4`条
+  全部集中在`jmeter-datadog-backend-listener`。旧版会按报错行号回推方法，但当行号轻微漂移到相邻测试方法附近时，会把`throws`错误地加到下一个方法上。
+- `jsonpath_case_repair_misfire` `2`条
+  全部集中在`fastjson`。补丁其实需要`com.jayway.jsonpath.JsonPath.parse(...)`，但旧版会把`JsonPath`误修成项目内的`com.alibaba.fastjson.JSONPath`。
+- `fixed_sha_test_root_search_gap` `2`条
+  全部集中在`nutz`。helper确实存在于`fixed_sha`里，但仓库用的是老式`test/...`目录布局，旧版`fixed_sha`检索只看`src/test/*`，所以直接漏掉了。
+- `patch_api_mismatch_assertj_chain` `2`条
+  全部集中在`Gaffer`。补丁切到AssertJ集合断言链，但目标版本并不支持当前链式写法，属于补丁侧API不成立。
+- `patch_api_mismatch_assertj_varargs` `2`条
+  全部集中在`jinjava`。补丁里的`containsExactlyInAnyOrder(1, 2, 3)`和目标版本的`List<?>`类型约束不兼容，属于补丁侧类型不成立。
+- `patch_api_mismatch_project_utility` `2`条
+  全部集中在`crane4j`。补丁调用了当前`original_sha`下并不存在的`CollectionUtils.isEqualCollection(...)`。
+
+从这个分布看，`v10`里仍然值得继续优化的工具侧问题是前五类，共`44`条。剩下`20`条已经清楚地属于补丁本身无效或API不成立，继续补环境和Docker也不会自然变成可编译。
+
+### 这次为什么`v10`前还没有解决
+
+前一轮已经把大方向收住了，但还剩四个具体漏洞：
+
+- `when(...)`的语义分流还不够细
+  旧逻辑只区分“裸调用”和“成员调用”，还不会把裸的`when(...).thenReturn(...)`识别成Mockito。
+- `fixed_sha` helper检索仍然偏向现代Maven目录
+  搜索列表里只有`src/test/*`，没有覆盖`nutz`这种老仓库的`test/...`布局。
+- checked exception修复还过度相信编译器行号
+  编译器行号如果轻微漂移到相邻方法附近，旧逻辑会优先相信行号，而不是请求方法本身。
+- `JsonPath`这类歧义符号还是会被仓库全局线索带偏
+  `fastjson`里仓库确实有`JSONPath`，但当前补丁正文已经明显处于jayway json-path语义里，旧逻辑仍然先吃了仓库全局线索。
+
+### 这一轮代码上的具体修复
+
+- `patch.py`
+  新增了Mockito与catch-exception的分流。`when(...).thenReturn(...)`、`when(...).thenThrow(...)`这类stub会优先绑定到`org.mockito.Mockito.when`，只有真正像`when(service).call()`或显式用了`caughtException()`的场景才会绑定到`CatchException.when`。
+- `patch.py`
+  `catch-exception`依赖推断现在只在真正的catch-exception语义下触发，不会再因为Mockito的裸`when(...)`误加一个解析不到的依赖。
+- `patch.py`
+  `fixed_sha` helper搜索目录扩展到了`test/java`、`test/groovy`、`test/scala`和`test`，覆盖老仓库测试目录布局。
+- `patch.py`
+  checked exception修复改成“请求方法优先，行号只在明确指向另一真实方法且不是轻微漂移时才覆盖”。这能避免把`throws`加到相邻方法上。
+- `patch.py`
+  歧义符号解析顺序改成“当前文件上下文优先于仓库全局导入线索”。并且新增了`JsonPath`的上下文判断，只要当前文件里有`ReadContext`、`DocumentContext`或`JsonPath.parse(...)`，就直接绑定到`com.jayway.jsonpath.JsonPath`。
+
+### 和`v10`结果的关系
+
+这一轮需要明确区分两件事：
+
+- `v10.csv`仍然对根因分析有价值
+- 但它已经不完全等于当前工作树的真实失败上界
+
+我在当前代码上直接对`graylog2-server`和`nutz`做了定点复现：
+
+- `graylog2-server`现在已经能从`fixed_sha`回补`assertJsonEqualsNonStrict(...)`
+- `nutz`之前失败的根因是`test/...`目录没有被搜索，这一轮已补上
+
+所以`v10`里的这20条`assertJsonEqualsNonStrict(...)`失败，不应该再继续简单归成“补丁本身坏了”。
+
+### 当前验证状态
+
+- 逐条诊断文件已生成：`results/verify_patch_batch_build_run_failures_rerun1_v10_diagnosis.csv`
+- 单元测试已通过：`python3 -m pytest tests -q`
+- 当前结果：`113 passed`
+
+这轮完成的是：
+
+- `v10`失败集逐条归因
+- 工具代码修复
+- README同步更新
+
+还没有用“生成`v10.csv`的原始输入批次”在当前代码上重新全量重跑。所以现在不能直接声称`v10`里的`64`条失败已经被清到什么水平。比较稳妥的判断是：
+
+- `mockito_when_context_misresolved`
+- `fixed_sha_test_root_search_gap`
+- `checked_exception_line_drift`
+- `jsonpath_case_repair_misfire`
+
+这四类工具侧失败现在已经有对应代码修复。
+
+- `JSON-java`
+- `Gaffer`
+- `jinjava`
+- `crane4j`
+
+这四类剩余样本仍然更像补丁本身无效或API不成立，不会因为继续修工具就全部转成可编译。
+
+## 小规模50次Rerun实验
+
+如果目标是验证“工具能不能靠重复执行发现不稳定性”，更合适的实验不是`verify-patch`，而是`detect-flaky`。因为这个实验只关心rerun检测能力，不应该把补丁应用、补丁构建失败或补丁语义正确性混进来。
+
+仓库里现在已经预置了一份更适合做patchless rerun的宽表数据集：
+
+- `patch-data/detect_flaky_original_wide_probe.csv`
+
+这份子集一共`20`条，全部来自`cleaned_mutation_data.csv`里原始`rerun_consistency=0.0`的样本，并且优先保留了前面批量实验里已经能正常完成构建和执行的项目。因为`detect-flaky`路径现在会把输入CSV的原始附加列一并透传到输出结果里，所以跑完后的结果文件本身就是宽表，不需要再额外联表查询`incorrect_type`、`isCorrect`、`flaky_code`、`generated_patch`这些信息。
+
+如果你要验证rerun工具本身的检测能力，直接用这一条命令：
+
+```bash
+python3 -m rerun_tool detect-flaky --csv patch-data/detect_flaky_original_wide_probe.csv --rerun 50 --docker always --runner standard --mode isolated -o results/detect_flaky_original_wide_probe_rerun50.csv
+```
+
+跑完后直接看`results/detect_flaky_original_wide_probe_rerun50.csv`里的这些列：
+
+- `rerun_results`
+- `verdict`
+- `checkpoint_10_verdict`
+- `checkpoint_20_verdict`
+- `checkpoint_30_verdict`
+- `checkpoint_40_verdict`
+- `checkpoint_50_verdict`
+
+只要某一行的`rerun_results`里同时出现`pass`和`fail`，或者某个checkpoint开始变成`FLAKY`，就说明这个patchless rerun实验确实暴露出了测试不稳定性。
+
+仓库里现在已经预置了一份小规模实验数据集：
+
+- `patch-data/incorrect_type_123_probe_small.csv`
+
+这份子集一共`8`条，来自`cleaned_mutation_data.csv`里语义上的`incorrect_type=1/2/3`样本，并且优先挑了前面批量结果里已经能完成构建和执行的项目，避免小实验大部分时间都耗在构建失败上。
+
+如果你只是要快速验证“rerun 50次后，`rerun_results`里会不会同时出现`pass`和`fail`”，直接用这一条命令：
+
+```bash
+python3 -m rerun_tool verify-patch --csv patch-data/incorrect_type_123_probe_small.csv --rerun 50 --docker always --runner standard --mode isolated -o results/incorrect_type_123_probe_small_rerun50.csv
+```
+
+跑完后直接看`results/incorrect_type_123_probe_small_rerun50.csv`里的`rerun_results`列。如果某一行同时出现`pass`和`fail`，就说明rerun工具已经在这个样本上实际捕捉到了不稳定性。
+
+下面这个扩展实验命令的目的，是在更大一点的小范围样本上验证rerun工具的“重复执行检测不稳定性”能力。它会：
+
+- 从`patch-data/cleaned_mutation_data.csv`里筛出`incorrect_type`在`1,2,3`中的样本
+- 生成一个小规模子集CSV
+- 对这个子集执行`50`次rerun
+- 最后打印出`rerun_results`里同时出现`pass`和`fail`的样本
+
+说明：
+
+- 当前`cleaned_mutation_data.csv`里这个筛选条件实际会命中`16`条样本，而且目前都落在`incorrect_type=1`
+- 判定标准就是`rerun_results`里同时有`pass`和`fail`
+
+```bash
+cd /home/lizhyu/libspace/FlakyAssessor_FSE/FlakyAssessor/test-runner
+
+python3 - <<'PY'
+import csv
+from pathlib import Path
+
+src = Path('patch-data/cleaned_mutation_data.csv')
+dst = Path('results/incorrect_type_123_probe.csv')
+kept = []
+with src.open(newline='', encoding='utf-8') as f:
+    for row in csv.DictReader(f):
+        if row.get('incorrect_type') in {'1', '2', '3'}:
+            kept.append(row)
+
+fieldnames = kept[0].keys() if kept else []
+dst.parent.mkdir(parents=True, exist_ok=True)
+with dst.open('w', newline='', encoding='utf-8') as f:
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(kept[:16])
+
+print(f'wrote {min(len(kept), 16)} rows to {dst}')
+PY
+
+python3 -m rerun_tool \
+  --csv results/incorrect_type_123_probe.csv \
+  --output results/incorrect_type_123_probe_rerun50.csv \
+  --rerun 50 \
+  --docker always \
+  --runner standard \
+  --mode isolated \
+  --build-timeout 900 \
+  --test-timeout 300 \
+  --build-retries 2 \
+  --git-timeout 2400 \
+  --git-retries 2
+
+python3 - <<'PY'
+import ast
+import csv
+from pathlib import Path
+
+result_csv = Path('results/incorrect_type_123_probe_rerun50.csv')
+mixed = []
+with result_csv.open(newline='', encoding='utf-8') as f:
+    for row in csv.DictReader(f):
+        try:
+            rerun_results = [str(x).strip().lower() for x in ast.literal_eval(row.get('rerun_results', '[]'))]
+        except Exception:
+            rerun_results = []
+        if 'pass' in rerun_results and 'fail' in rerun_results:
+            mixed.append((row['project_name'], row['full_test_name'], row['rerun_results']))
+
+print(f'mixed pass/fail rows: {len(mixed)}')
+for project_name, full_test_name, rerun_results in mixed:
+    print(f'{project_name} | {full_test_name} | {rerun_results}')
+PY
+```
+
+如果这个实验里出现了`mixed pass/fail rows > 0`，就说明工具的重复执行能力确实捕捉到了“同一个补丁应用后同一个测试有时通过、有时失败”的不稳定性。下一步最有价值的动作，就是对这些命中的样本再看`checkpoint_10`、`checkpoint_20`、`checkpoint_30`、`checkpoint_40`和`checkpoint_50`，判断发现不稳定性的rerun次数阈值到底落在哪一段。
+
+## 第十二轮复盘：ID类测试的rerun语义需要“扰动批次”，不是重复同一条轨迹
+
+前面的`detect_flaky_original_wide_probe_rerun50.csv`之所以`50`次结果几乎全稳定，不是工具已经证明这些测试不 flaky，而是实验语义本身不对。对以`ID`为主的样本，如果每一轮都在同一实现、同一集合迭代策略、同一JVM轨迹下重复执行，那么`standard + isolated`本质上只是在重复同一个确定性执行路径。跑`50`次和跑`5`次没有本质区别。
+
+结合参考论文和这轮实测，当前工具需要把三类测试分开理解：
+
+- `ID`
+  需要“实现扰动下的重复执行”。当前工具用`NonDex`作为`ID`类型的扰动执行后端，但语义已经改成了“一次批量rerun实验”，不再是外层循环调用`nondexRuns=1`。
+- `NIO`
+  需要“同一环境内重复执行”。这类问题不能只靠`forkCount=0`，而是要真正做到同一JVM或同一类加载环境中的连续复跑。
+- `OD`
+  需要“顺序扰动或前置污染者”。只重跑目标测试本身，通常不足以暴露这类问题。
+
+这轮对`ID`链路的根修复是：
+
+- `--runner nondex`下，`--rerun N`现在表示`1次clean基线 + N-1次扰动运行`
+- 工具不再把`NonDex`当成“单次pass/fail命令”
+- 当前会在一次`NonDex`调用完成后，解析`.nondex/*.run`和各个run目录里的Surefire XML，恢复整组`rerun_results`
+- 结果CSV中的`verdict`现在会真实反映这组内部运行是否出现`pass/fail`混合
+
+最小可复现实验已经验证通过。仓库里预置了一个单条`ID`校准数据集：
+
+- `patch-data/id_nondex_fastjson_issue1480.csv`
+
+直接执行这一条命令：
+
+```bash
+python3 -m rerun_tool detect-flaky --csv patch-data/id_nondex_fastjson_issue1480.csv --rerun 20 --runner nondex --docker never --mode isolated -o results/id_nondex_fastjson_issue1480_rerun20_v2.csv
+```
+
+当前实测输出里，这条样本的`rerun_results`已经变成：
+
+```text
+["pass", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail", "fail"]
+```
+
+对应`verdict=FLAKY`。这说明问题不在“rerun次数不够”，而在于以前没有把`ID`类测试所需的实现扰动纳入rerun语义。
+
+实际使用建议也需要同步调整：
+
+- 如果数据以`ID`为主，不要再把`--runner standard --mode isolated`当成主检测命令
+- `standard + isolated`更适合做clean baseline
+- `nondex`现在应该被视为“ID类rerun后端”，而不是一个和rerun分离的额外验证脚本
+- 之后如果要继续扩展`OD`和`NIO`，应该分别补“顺序扰动批次”和“同环境连续复跑”两条执行链路，而不是继续加大`standard isolated`的次数
+
+## 第十三轮复盘：把“flaky类型”和“rerun方式”拆开，CLI才会清楚
+
+前面一轮虽然已经把`ID`样本跑通了，但CLI仍然有两个问题：
+
+- 用户还是容易从`--runner`和`--mode`出发，而不是从`测试类型`出发
+- `ID`、`NIO`、`OD`、`NOD`这些概念还没有在命令层变成稳定的输入模型
+
+这会直接带来两个坏结果：
+
+- 同样叫“rerun 20次”，不同类型的样本其实在做完全不同的实验，但命令行看不出来
+- `NOD`这类上位类会让工具被迫拍脑袋选策略，最后不是误判，就是静默走错后端
+
+这一轮把CLI重新收成了三层语义：
+
+1. 工作流层
+   - `verify-patch`
+   - `detect-flaky`
+   - `detect-flaky-external`
+2. 类型层
+   - `unknown`
+   - `id`
+   - `nio`
+   - `od`
+   - `nod`
+3. 执行层
+   - `baseline`
+   - `same_env`
+   - `impl_perturb`
+   - `order_perturb`
+
+现在的规则是：
+
+- 默认只暴露`--flaky-type`和`--profile`
+- `--runner`和`--mode`保留为隐藏的高级兼容参数
+- `detect-flaky-external nondex`明确表示“调用外部实现扰动后端”
+- 如果只写`--flaky-type id`，工具会自动映射到`impl_perturb -> external:nondex`
+- 如果只写`--flaky-type nio`，工具会自动映射到`same_env -> native same_jvm`
+- 如果只写`--flaky-type nod`，工具会拒绝自动选择并要求进一步细化
+- 如果写`--flaky-type od`，工具会明确提示当前还缺少真正的顺序扰动后端
+
+## 第十四轮复盘：结果宽表、端到端时间口径和NonDex批量恢复
+
+这轮针对`python3 -m rerun_tool verify-patch --csv patch-data/cleaned_mutation_data.csv --flaky-type id --rerun 20 ...`暴露出来的三个具体问题做了收口。
+
+第一个问题是结果表不够宽。之前`detect-flaky`路径已经会透传原始CSV的附加列，但`verify-patch`还没有。这样看`verify-patch`结果时，经常还要回去联表查`isCorrect`、`incorrect_type`、`augmented_source_marker`、`rerun_consistency`。现在这条路径也会保留原始附加列，所以只要输入CSV里有这些列，结果CSV就会直接写出来。
+
+第二个问题是时间口径不够直观。虽然旧版`checkpoint_<N>_total_elapsed_seconds`本来就包含构建，但列名不够显式，而且没有阶段拆分，很容易误读成“只有rerun时间”。现在结果里额外补了：
+
+- `clone_elapsed_seconds`
+- `prepare_elapsed_seconds`
+- `build_elapsed_seconds`
+- `pre_rerun_elapsed_seconds`
+- `end_to_end_elapsed_seconds`
+- `checkpoint_<N>_end_to_end_elapsed_seconds`
+
+这样可以直接核对：
+
+- `pre_rerun_elapsed_seconds = clone + prepare + build`
+- `checkpoint_<N>_end_to_end_elapsed_seconds = pre_rerun_elapsed_seconds + checkpoint_<N>_rerun_elapsed_seconds`
+
+第三个问题比宽表更严重：部分NonDex批量实验明明所有内部run都通过了，但因为`.nondex`目录里的manifest或XML在某些项目里没有稳定留下来，旧逻辑会把整批都写成`error`，最后结果表里出现假的`RUN_ERROR`。现在的恢复顺序改成了：
+
+- 先用`.nondex` manifest 和 surefire XML恢复每轮结果
+- 如果manifest恢复全掉成`error`，或者根本拿不到`.nondex`内部结果，再从真实命令输出里按run区块恢复每轮`pass/fail/error`
+
+这能直接吃掉像`jetcache`、`nacos`这类“测试全过但结果表里被误写成50个error”的假失败。核心不是补更多重试，而是把批量NonDex实验真正还原成每一轮的真实结果。 
+
+这轮也把请求级执行策略真正接进了工作流，而不是只停留在CLI解析层：
+
+- 批量CSV里不同样本可以有不同`test_type`
+- 每条请求都会独立解析自己的`execution_profile`
+- workflow不再盲目使用全局`config.mode`
+- `same_env`请求会真正走`same_jvm`
+- `impl_perturb`请求会真正走隔离式外部扰动执行
+
+最重要的结论是：
+
+- 以前检测不出来，不是因为“rerun次数不够”
+- 也不是因为“工具不会统计pass/fail混合”
+- 根因是“实验设计和flaky类型不匹配”
+
+只有把`rerun`从“重复执行几次”重构成“按类型选择合适的重复执行实验”，这个工具的命令接口、结果解释和后续扩展方向才会一致。
+
+## 第十五轮复盘：`verify_patch_all_id_rerun_50_results_v1.csv`里的失败主要不是“50次rerun没执行”，而是批量NonDex和工作区清理还没收干净
+
+这轮先澄清一个容易误判的点。用户最初点开的文件是：
+
+- `results/.ipynb_checkpoints/verify_patch_all_id_rerun_50_results_v1-checkpoint.csv`
+
+这份 checkpoint 文件只有 `7` 行，而且全部是 `completed + STABLE_PASS`。真正需要分析的是：
+
+- `results/verify_patch_all_id_rerun_50_results_v1.csv`
+
+这份主结果文件共有 `246` 行，其中：
+
+- `STABLE_PASS` `162`
+- `FLAKY` `34`
+- `BUILD_ERROR` `18`
+- `SETUP_ERROR` `16`
+- `RUN_ERROR` `8`
+- `STABLE_FAIL` `8`
+
+也就是说，这一轮真正需要解释的失败是 `42` 条。逐条诊断文件已经落到：
+
+- `results/verify_patch_all_id_rerun_50_results_v1_diagnosis.csv`
+
+当前逐条归因后，失败主要分成这些类别：
+
+- `workspace_permission_residue` `16`
+- `patch_invalid_helper_api` `9`
+- `nondex_batch_timeout_underbudget` `7`
+- `patch_invalid_source_text` `4`
+- `mockito_static_import_gap` `1`
+- `quality_gate_skip_gap` `1`
+- `nondex_project_flag_gap` `1`
+- `contextual_import_resolution_gap` `1`
+- `patch_invalid_assertj_usage` `1`
+- `compile_gap_other` `1`
+
+### 这轮确认的工具根因
+
+`SETUP_ERROR`的 `16` 条不是 Git clone 本身有问题，而是前一轮 Docker/NonDex 在 bind mount 的工作区里留下了 root:root 的 `target` 或 `.nondex` 残留。最典型的日志是：
+
+- `cloudstack` / `hop`: `Permission denied: '.plxarc'`
+- `jinjava`: `Permission denied: 'test-annotations'`
+
+这些目录不是补丁问题，而是工作区删除阶段无法清理容器残留。现在 `rerun_tool.repo._remove_workspace(...)` 已经改成：
+
+- 先按宿主机权限直接删除
+- 如果命中 `PermissionError`
+- 自动启一个临时 Docker 容器把工作区 `chown` 回宿主机 UID/GID，并补 `u+rwX`
+- 再重试删除
+
+这条链路已经做了真实环境校验，不只是 mock：先用 Docker 在临时目录里创建 root-owned 的 `target/.plxarc` 和 `.nondex/LATEST`，再调用 `_remove_workspace(...)`，当前结果已经能稳定返回：
+
+```text
+remove ok True
+message Removed workspace ... after permission repair
+after exists False
+```
+
+`RUN_ERROR`里最集中的 `7` 条 `NonDex test timed out after 300s` 也不是“rerun没执行”，而是批量 NonDex 仍然沿用了单次测试的 `300s` 超时预算。对 `ID` 的 `--rerun 50`，现在真正的语义是：
+
+- `1次clean baseline`
+- `49次实现扰动`
+
+它本来就是一整个批次命令，不应该再套用单轮 `test_timeout`。现在 `_run_maven_nondex_batch_with_summary(...)` 已经改成按批次规模放宽超时预算：
+
+- `1` 轮仍用原始 `test_timeout`
+- `20` 轮放大到 `2x`
+- `50` 轮直接放大到 `6x`
+
+也就是默认 `test_timeout=300` 时：
+
+- `--rerun 50` 的批量 NonDex 现在会给到 `1800s`
+
+`timely` 那条 `RUN_ERROR`是另一类工具问题。它的日志不是测试失败，而是 rerun 阶段重新掉进了：
+
+- `io.netty:netty-tcnative:jar:linux-x86_32:2.0.7.Final`
+
+这说明之前 `_maven_project_flags(...)` 只在基线构建路径生效，没有传到 NonDex rerun 命令里。现在 `_run_maven_nondex_test_with_output(...)` 和 `_run_maven_nondex_batch_with_summary(...)` 都会追加项目级 Maven 参数，所以 `timely` 这类依赖 `${os.detected.classifier}` 的项目不再会在 rerun 阶段重新退化成 `linux-x86_32`。
+
+`spring-cloud-config` 那条 `BUILD_ERROR`也属于工具问题。它不是补丁本身编不过，而是 `maven-checkstyle-plugin` 和 `spring-javaformat` 还在目标测试编译前拦构建。当前稳定性参数除了已有的：
+
+- `-Dcheckstyle.skip=true`
+
+又补了这些兼容开关：
+
+- `-DskipCheckstyle=true`
+- `-Dskip.checkstyle=true`
+- `-Dbasepom.check.skip-checkstyle=true`
+- `-Dspring-javaformat.skip=true`
+
+这轮还顺手修了两个高频的补丁上下文误解析：
+
+- `atLeastOnce()` 现在会解析到 `org.mockito.Mockito.atLeastOnce`
+- `CollectionUtils.isEqualCollection(...)` 现在会优先绑定到 `org.apache.commons.collections4.CollectionUtils`
+
+这两条分别对应：
+
+- `incubator-shardingsphere`
+- `crane4j`
+
+### 为什么`ID rerun 50次`看起来“很快”
+
+这轮也重新检查了“是不是根本没跑满 50 次”。结论是：
+
+- 不能拿结果里少数失败行的 `rerun_elapsed_seconds=0` 去推断整个批次都没跑
+- 对于稳定完成的行，当前工具确实已经在做 `50` 次内部运行恢复
+
+从 `verify_patch_all_id_rerun_50_results_v1.csv` 里抽样看：
+
+- `fastjson` 的一些样本 `50` 次批量扰动大约 `37s` 到 `48s`
+- `jetcache` 大约 `86s` 到 `88s`
+- `apollo` 的稳定通过样本大约 `82s` 到 `98s`
+- `flowable-engine` 的重样本大约 `272s` 到 `286s`
+
+这说明：
+
+- build 只做一次
+- rerun 是在一次批量 NonDex 调用里完成
+- 小而快的单测 `50` 次跑在几十秒并不反常
+- 真正异常的是那些 `rerun_elapsed_seconds=0` 的失败行，它们多数是批量命令在进入内部 run 恢复前就已经被整体超时或依赖解析拦下了
+
+换句话说，这一轮“速度快”的主因不是统计错了，而是：
+
+- 成功样本本来就走的是“一次构建 + 一批内部扰动”
+- 失败样本里有一部分根本没成功进入完整批次
+
+### 这轮之后还剩什么
+
+这轮修掉的是明确属于工具的问题，主要是：
+
+- 工作区 root 权限残留清理
+- NonDex 批量超时预算
+- NonDex 路径丢失项目级 Maven 参数
+- Checkstyle / Spring Java Format 质量门跳过别名
+- Mockito `atLeastOnce` 与 commons `CollectionUtils` 的误解析
+
+仍然不应该继续靠环境层“硬修”的失败，当前主要是这些：
+
+- `graylog2-server`
+  补丁直接调用目标仓库不存在的 `assertJsonEqualsNonStrict(...)`
+- `JSON-java`
+  补丁文本在原始 SHA 上落成了非法 Java 源码
+- `jinjava`
+  补丁引入了不成立的 AssertJ varargs 调用
+
+这些更接近“补丁本身不成立”，而不是 Docker、构建参数或 rerun 环境问题。工具可以继续把诊断做得更清楚，但不应该为了追求构建成功率去静默重写补丁语义。

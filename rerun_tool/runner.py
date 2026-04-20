@@ -14,6 +14,7 @@ import platform
 import re
 import subprocess
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple  # 导入字典、列表、可选值与元组类型注解。
@@ -61,6 +62,10 @@ class TestRunResult:
     results: List[str] = field(default_factory=list)
     error_message: str = ""
     build_output: str = ""
+    clone_elapsed_seconds: float = 0.0  # 保存克隆与检出阶段耗时。
+    prepare_elapsed_seconds: float = 0.0  # 保存补丁应用或测试文件定位阶段耗时。
+    build_elapsed_seconds: float = 0.0  # 保存构建阶段耗时。
+    pre_rerun_elapsed_seconds: float = 0.0  # 保存进入 rerun 之前的累计耗时，便于直接校验 checkpoint 总耗时是否包含构建。
     total_elapsed_seconds: float = 0.0  # 保存包含克隆、构建与重跑在内的总耗时。
     rerun_elapsed_seconds: float = 0.0  # 保存纯重跑阶段的累计耗时。
     checkpoint_total_elapsed_seconds: Dict[int, float] = field(default_factory=dict)  # 保存各阶段包含构建等在内的累计耗时。
@@ -385,6 +390,14 @@ def run_test_with_summary(repo_dir: str, entry: TestEntry, rerun_count: int, mod
         for checkpoint in checkpoint_targets:  # 为所有关键阶段补上 0 秒耗时以保持结果结构完整。 
             checkpoint_rerun_elapsed_seconds[checkpoint] = 0.0  # 当前没有真正进入 rerun 阶段，因此耗时恒为 0。 
         return RerunExecutionSummary(results=['error'] * rerun_count, rerun_elapsed_seconds=0.0, checkpoint_rerun_elapsed_seconds=checkpoint_rerun_elapsed_seconds, error_outputs=[resolved_env.error_message])  # 返回全 error 的执行摘要并保留环境错误。 
+    if runner_backend == RunnerBackend.NONDEX:  # ID 类测试需要把一次 NonDex 调用视为一批扰动重跑。 
+        if build_tool != 'maven':  # 当前只有 Maven 项目支持 NonDex。 
+            unsupported_message = "NonDex backend is currently only supported for Maven projects"  # 复用既有能力边界文案。 
+            logger.error(unsupported_message)  # 记录当前能力边界。 
+            for checkpoint in checkpoint_targets:  # 保持结果结构完整。 
+                checkpoint_rerun_elapsed_seconds[checkpoint] = 0.0  # 当前没有真正执行任何 rerun。 
+            return RerunExecutionSummary(results=['error'] * rerun_count, rerun_elapsed_seconds=0.0, checkpoint_rerun_elapsed_seconds=checkpoint_rerun_elapsed_seconds, error_outputs=[unsupported_message])  # 返回统一的 error 摘要。 
+        return _run_maven_nondex_batch_with_summary(repo_dir=repo_dir, entry=entry, total_runs=rerun_count, timeout=timeout, use_docker=use_docker, docker_image=docker_image)  # 直接返回一整批实现扰动重跑的结果。 
     rerun_started_at = time.perf_counter()  # 记录纯 rerun 阶段的起始时间。 
     for i in range(rerun_count):
         logger.info(f"  Run {i + 1}/{rerun_count}")
@@ -496,6 +509,7 @@ def _run_maven_nondex_test_with_output(repo_dir: str, entry: TestEntry, timeout:
     ]  # 完成 NonDex 核心命令参数构造。 
     cmd_parts.extend(_maven_stability_flags(include_test_failure_ignore=True))  # 复用 Maven 稳定性降噪参数。 
     cmd_parts.extend(_maven_network_flags())  # 复用 Maven 网络重试参数。 
+    cmd_parts.extend(_maven_project_flags(repo_dir, entry))  # NonDex 路径同样需要继承项目级系统属性，否则 `timely` 一类项目会在 rerun 阶段重新掉进 classifier 解析错误。 
     mvn = _get_local_maven_cmd(repo_dir)  # 继续优先使用项目自带的 Maven wrapper。 
     if entry.module and entry.module != '.':  # 多模块仓库仍然需要限定目标模块并联动上游依赖。 
         cmd_parts.extend(['-pl', entry.module, '-am'])  # 追加 Maven 多模块参数。 
@@ -514,6 +528,278 @@ def _run_maven_nondex_test_with_output(repo_dir: str, entry: TestEntry, timeout:
     except Exception as e:  # 捕获其余执行期异常。 
         logger.error(f"NonDex test execution failed: {e}")  # 记录执行失败原因。 
         return "error", f"NonDex test execution failed: {e}"  # 返回 error 与异常说明。 
+
+
+def _run_maven_nondex_batch_with_summary(repo_dir: str, entry: TestEntry, total_runs: int, timeout: int, use_docker: bool, docker_image: Optional[str]) -> RerunExecutionSummary:  # 将一次 NonDex 调用视为一批实现扰动重跑并恢复整组结果。 
+    desired_total_runs = max(1, total_runs)  # 至少保留一次结果，避免非法的零次实验。 
+    nondex_runs = max(1, desired_total_runs - 1)  # 将 `--rerun N` 解释为 `1次clean基线 + N-1次扰动运行`。 
+    effective_timeout = _nondex_batch_timeout(timeout, desired_total_runs)  # 批量 NonDex 会在一次命令里跑多轮，需要按批次规模放宽整体超时预算。 
+    test_spec = f"{entry.test_class}#{entry.test_method}"  # 构造 Maven 可识别的测试选择器。 
+    manifest_snapshot = set(_list_nondex_manifest_paths(repo_dir, entry))  # 记录执行前已有的 manifest，便于识别本次新增结果。 
+    cmd_parts = _maven_cli_args(repo_dir) + [  # 统一拼接一批 NonDex 扰动实验命令。 
+        'edu.illinois:nondex-maven-plugin:2.1.7:nondex',  # 使用稳定的 NonDex Maven 插件版本。 
+        '--batch-mode',  # 关闭交互输出便于日志解析。 
+        '-fn',  # 允许 Maven 输出完整上下文。 
+        f'-Dtest={test_spec}',  # 只执行目标测试方法。 
+        f'-DnondexRuns={nondex_runs}',  # 在一次命令里完成多轮实现扰动。 
+        '-Dsurefire.useFile=false',  # 将 surefire 输出写到标准输出。 
+        '-DfailIfNoTests=false',  # 关闭无测试匹配导致的 Maven 失败。 
+        '-Dsurefire.failIfNoSpecifiedTests=false',  # 关闭上游模块无匹配测试导致的失败。 
+    ]  # 完成当前批量实验参数构造。 
+    cmd_parts.extend(_maven_stability_flags(include_test_failure_ignore=True))  # 继续复用 Maven 降噪参数。 
+    cmd_parts.extend(_maven_network_flags())  # 继续复用 Maven 网络重试参数。 
+    cmd_parts.extend(_maven_project_flags(repo_dir, entry))  # 批量实现扰动命令必须和基线构建共用项目特定参数，避免 rerun 阶段重新引入依赖解析偏差。 
+    mvn = _get_local_maven_cmd(repo_dir)  # 继续优先使用项目自带的 Maven wrapper。 
+    if entry.module and entry.module != '.':  # 多模块仓库仍需限定目标模块并联动上游依赖。 
+        cmd_parts.extend(['-pl', entry.module, '-am'])  # 追加模块范围参数。 
+
+    rerun_started_at = time.perf_counter()  # 记录当前批量实验的壁钟起始时间。 
+    output = ''  # 初始化输出文本，便于异常分支统一复用。 
+    try:  # 统一处理 Docker、本地、超时与基础设施异常。 
+        if use_docker and docker_image:  # Docker 模式下继续沿用 wrapper 回退链。 
+            docker_success, output = _run_in_docker_variants(docker_image, repo_dir, _get_docker_maven_cmd_variants(repo_dir, cmd_parts), effective_timeout)  # 在 Docker 中执行当前批量 NonDex 命令。 
+            returncode = 0 if docker_success else 1  # 将布尔结果显式转换为整数退出码。 
+        else:  # 本地模式下直接调用 Maven。 
+            result = subprocess.run([mvn] + cmd_parts, cwd=repo_dir, capture_output=True, text=True, timeout=effective_timeout, env=_get_build_env(repo_dir))  # 执行本地 NonDex 批量实验命令。 
+            returncode = result.returncode  # 保留本地命令退出码。 
+            output = result.stdout + '\n' + result.stderr  # 合并标准输出与错误输出。 
+    except subprocess.TimeoutExpired:  # 超时统一视为整批实验 error。 
+        timeout_message = f"NonDex test timed out after {effective_timeout}s"  # 构造统一超时说明。 
+        logger.warning(timeout_message)  # 记录 NonDex 批量实验超时。 
+        checkpoints = {checkpoint: 0.0 for checkpoint in _checkpoint_targets(desired_total_runs)}  # 以 0 填充所有阶段耗时。 
+        return RerunExecutionSummary(results=['error'] * desired_total_runs, rerun_elapsed_seconds=0.0, checkpoint_rerun_elapsed_seconds=checkpoints, error_outputs=[timeout_message])  # 返回全 error 摘要。 
+    except Exception as e:  # 捕获其余执行期异常。 
+        error_message = f"NonDex test execution failed: {e}"  # 构造统一异常说明。 
+        logger.error(error_message)  # 记录执行失败原因。 
+        checkpoints = {checkpoint: 0.0 for checkpoint in _checkpoint_targets(desired_total_runs)}  # 以 0 填充所有阶段耗时。 
+        return RerunExecutionSummary(results=['error'] * desired_total_runs, rerun_elapsed_seconds=0.0, checkpoint_rerun_elapsed_seconds=checkpoints, error_outputs=[error_message])  # 返回全 error 摘要。 
+
+    rerun_elapsed_seconds = time.perf_counter() - rerun_started_at  # 记录整批 NonDex 实验的壁钟耗时。 
+    run_ids, nondex_dir = _resolve_nondex_run_ids(repo_dir=repo_dir, entry=entry, output=output, manifest_snapshot=manifest_snapshot)  # 基于当前输出和 manifest 定位本次批次的全部 run id 以及对应的 `.nondex` 目录。 
+    parsed_results = _parse_nondex_manifest_results(nondex_dir=nondex_dir, run_ids=run_ids, entry=entry)  # 从目标 `.nondex` 目录里的 surefire XML 恢复每轮结果。 
+    output_results = _normalize_output_run_results(_parse_nondex_output_runs(output), desired_total_runs=desired_total_runs)  # `.nondex` 目录缺失或 XML 被清理时，再从真实命令输出里恢复每轮结果。 
+    if parsed_results:  # 优先使用 manifest 恢复的结果，但允许在 manifest 全部掉成 error 时回退到输出恢复。 
+        normalized_runs = _normalize_nondex_runs(parsed_results=parsed_results, desired_total_runs=desired_total_runs)  # 将 clean 基线放到最前，并裁剪或补齐到期望长度。 
+        manifest_results = [result for result, _ in normalized_runs]  # 仅保留标准化后的结果序列。 
+        results = _prefer_nondex_output_results(manifest_results=manifest_results, output_results=output_results)  # 当 manifest 结果明显因为目录缺失而退化时，优先使用命令输出恢复的结果。 
+        checkpoints = _estimate_batched_checkpoint_elapsed_seconds(total_elapsed_seconds=rerun_elapsed_seconds, total_runs=len(results), checkpoints=_checkpoint_targets(len(results)))  # 为当前批量执行结果按 run 占比近似关键阶段壁钟耗时。 
+        error_outputs = [_tail_command_output(output)] if any(result == 'error' for result in results) and output.strip() else []  # 只有仍存在 error 结果时才保留关键输出尾部。 
+        return RerunExecutionSummary(results=results, rerun_elapsed_seconds=rerun_elapsed_seconds, checkpoint_rerun_elapsed_seconds=checkpoints, error_outputs=error_outputs)  # 返回最终选定的批量结果摘要。 
+    if not output_results:  # manifest 和输出都无法恢复内部 run 结果时才退回单条输出解析。 
+        fallback_result = _parse_test_result(returncode, output)  # 退回到原有的单次输出解析逻辑。 
+        checkpoints = _estimate_batched_checkpoint_elapsed_seconds(total_elapsed_seconds=rerun_elapsed_seconds, total_runs=desired_total_runs, checkpoints=_checkpoint_targets(desired_total_runs))  # 缺少内部时间戳时按 run 比例近似关键阶段耗时。 
+        error_outputs = [_tail_command_output(output)] if fallback_result == 'error' and output.strip() else []  # 只有 error 才保留关键输出。 
+        return RerunExecutionSummary(results=[fallback_result] * desired_total_runs, rerun_elapsed_seconds=rerun_elapsed_seconds, checkpoint_rerun_elapsed_seconds=checkpoints, error_outputs=error_outputs)  # 返回退化后的统一摘要。 
+    checkpoints = _estimate_batched_checkpoint_elapsed_seconds(total_elapsed_seconds=rerun_elapsed_seconds, total_runs=len(output_results), checkpoints=_checkpoint_targets(len(output_results)))  # 输出恢复场景下同样按 run 占比近似关键阶段壁钟耗时。 
+    error_outputs = [_tail_command_output(output)] if any(result == 'error' for result in output_results) and output.strip() else []  # 仅在输出恢复结果仍含 error 时保留关键日志尾部。 
+    return RerunExecutionSummary(results=output_results, rerun_elapsed_seconds=rerun_elapsed_seconds, checkpoint_rerun_elapsed_seconds=checkpoints, error_outputs=error_outputs)  # 返回基于输出恢复的批量 NonDex 执行摘要。 
+
+
+def _candidate_nondex_dirs(repo_dir: str, entry: TestEntry) -> List[str]:  # 生成当前请求可能写入 `.nondex` 结果的候选目录，优先目标模块，再回退仓库根。 
+    nondex_dirs: List[str] = []  # 保存按优先级排序的 `.nondex` 候选目录。 
+    for build_dir in _candidate_build_dirs(repo_dir, entry.module):  # 复用现有“模块到仓库根”的目录优先级。 
+        nondex_dir = os.path.join(build_dir, '.nondex')  # 当前构建目录对应的 `.nondex` 目录。 
+        if nondex_dir in nondex_dirs:  # 去掉规范化路径重复导致的重复候选。 
+            continue  # 跳过重复目录。 
+        nondex_dirs.append(nondex_dir)  # 保留当前 `.nondex` 候选目录。 
+    return nondex_dirs  # 返回按模块优先级排序的 `.nondex` 候选目录列表。 
+
+
+def _list_nondex_manifest_paths(repo_dir: str, entry: TestEntry) -> List[str]:  # 列出当前请求所有候选 `.nondex` 目录下的 manifest 文件。 
+    manifest_paths: List[str] = []  # 保存聚合后的 manifest 路径列表。 
+    for nondex_dir in _candidate_nondex_dirs(repo_dir, entry):  # 依次检查目标模块和仓库根等候选目录。 
+        if not os.path.isdir(nondex_dir):  # 当前候选目录不存在时直接跳过。 
+            continue  # 继续检查下一个候选目录。 
+        manifest_paths.extend(os.path.join(nondex_dir, name) for name in os.listdir(nondex_dir) if name.endswith('.run'))  # 聚合当前目录下的全部 manifest。 
+    return sorted(manifest_paths)  # 返回稳定排序后的 manifest 路径列表。 
+
+
+def _resolve_nondex_run_ids(repo_dir: str, entry: TestEntry, output: str, manifest_snapshot: set) -> Tuple[List[str], str]:  # 基于当前输出和执行前快照定位本次 NonDex 批次的全部 run id 及其 `.nondex` 目录。 
+    candidate_nondex_dirs = _candidate_nondex_dirs(repo_dir, entry)  # 先生成目标模块优先的 `.nondex` 候选目录列表。 
+    current_manifests = set(_list_nondex_manifest_paths(repo_dir, entry))  # 读取执行后的全部 manifest 文件。 
+    new_manifests = sorted(current_manifests - manifest_snapshot, key=lambda path: os.path.getmtime(path))  # 优先使用本次命令新增的 manifest。 
+    candidate_manifest = ''  # 初始化当前候选 manifest。 
+    for nondex_dir in candidate_nondex_dirs:  # 优先在目标模块对应的 `.nondex` 目录里寻找本次新增 manifest。 
+        dir_manifests = [path for path in new_manifests if os.path.dirname(path) == nondex_dir]  # 过滤出当前目录下新增的 manifest。 
+        if dir_manifests:  # 命中当前目录新增 manifest 时直接取最新那个。 
+            candidate_manifest = dir_manifests[-1]  # 使用当前优先级目录里最新的 manifest。 
+            break  # 模块优先命中后即可停止。 
+    if not candidate_manifest and new_manifests:  # 所有优先级目录都没命中时，再回退到新增 manifest 的全局最新值。 
+        candidate_manifest = new_manifests[-1]  # 使用全局最新 manifest 作为兜底。 
+    if not candidate_manifest:  # 没有新增 manifest 时退回到输出中声明的 run id。 
+        match = re.search(r'\[NonDex\]\s+The id of this run is:\s*(\S+)', output)  # 解析 NonDex 总结行里的首个 run id。 
+        if match:  # 命中首个 run id 时尝试直接定位对应 manifest。 
+            for nondex_dir in candidate_nondex_dirs:  # 依次在候选 `.nondex` 目录中寻找该 run id 对应的 manifest。 
+                manifest_path = os.path.join(nondex_dir, f"{match.group(1)}.run")  # 该 run id 在当前候选目录下的 manifest 路径。 
+                if os.path.isfile(manifest_path):  # 找到 manifest 文件时直接采用。 
+                    candidate_manifest = manifest_path  # 更新当前候选 manifest。 
+                    break  # 命中后停止继续搜索。 
+    if not candidate_manifest:  # 仍然没有定位到 manifest 时最后回退到 `.nondex/LATEST`。 
+        for nondex_dir in candidate_nondex_dirs:  # 依次检查候选 `.nondex` 目录下的 LATEST 文件。 
+            latest_path = os.path.join(nondex_dir, 'LATEST')  # 当前候选目录下的 LATEST 文件路径。 
+            if os.path.isfile(latest_path):  # 只有文件存在时才可读取。 
+                return _read_nondex_run_ids(latest_path), nondex_dir  # 直接返回最近一次批次的 run id 列表及其所在目录。 
+        return [], ''  # 三种定位方式都失败时返回空列表和空目录。 
+    return _read_nondex_run_ids(candidate_manifest), os.path.dirname(candidate_manifest)  # 返回当前 manifest 中记录的 run id 序列及其所在 `.nondex` 目录。 
+
+
+def _read_nondex_run_ids(manifest_path: str) -> List[str]:  # 读取 NonDex manifest 或 LATEST 文件中的 run id。 
+    try:  # 文件可能在并发或异常情况下缺失，需要保守处理。 
+        with open(manifest_path, 'r', encoding='utf-8', errors='ignore') as fh:  # 以宽松编码读取文本文件。 
+            return [line.strip() for line in fh if line.strip()]  # 返回去掉空行后的 run id 列表。 
+    except OSError:  # 文件不可读时直接返回空列表。 
+        return []  # 让调用方回退到输出解析逻辑。 
+
+
+def _parse_nondex_manifest_results(nondex_dir: str, run_ids: List[str], entry: TestEntry) -> List[Tuple[str, str]]:  # 从 NonDex manifest 指向的 surefire XML 中恢复每轮结果。 
+    parsed_runs: List[Tuple[str, str]] = []  # 保存 `(result, run_id)` 对，后续还要按 clean 基线重新排序。 
+    if not nondex_dir or not os.path.isdir(nondex_dir):  # `.nondex` 目录缺失时无法继续按 manifest 恢复。 
+        return parsed_runs  # 直接返回空结果，让调用方回退到输出恢复。 
+    for run_id in run_ids:  # 逐个解析当前批次的 run 目录。 
+        run_dir = os.path.join(nondex_dir, run_id)  # 拼接具体 run 的目录路径。 
+        xml_path = _locate_nondex_report_xml(run_dir=run_dir, entry=entry)  # 定位目标测试对应的 surefire XML 报告。 
+        if not xml_path:  # XML 缺失时把该轮记成 error。 
+            parsed_runs.append(('error', run_id))  # 保留 run id 便于后续重排。 
+            continue  # 继续解析下一轮。 
+        parsed_runs.append((_parse_nondex_report_result(xml_path), run_id))  # 解析 XML 后记录结果与 run id。 
+    return parsed_runs  # 返回当前批次全部可恢复的结果。 
+
+
+def _locate_nondex_report_xml(run_dir: str, entry: TestEntry) -> Optional[str]:  # 在单个 NonDex run 目录下定位目标测试的 XML 报告。 
+    if not os.path.isdir(run_dir):  # run 目录缺失时直接返回空值。 
+        return None  # 当前轮结果无法恢复。 
+    preferred_names = [  # 优先按最精确的 surefire XML 命名尝试定位。 
+        f"TEST-{entry.test_class}.xml",  # 标准 surefire 报告命名。 
+        f"TEST-{entry.test_class.replace('$', '.')}.xml",  # 某些内部类报告会将 `$` 展开为 `.`。 
+    ]  # 完成优先文件名候选。 
+    for filename in preferred_names:  # 先尝试精确匹配。 
+        candidate = os.path.join(run_dir, filename)  # 拼接当前候选 XML 路径。 
+        if os.path.isfile(candidate):  # 找到文件后直接返回。 
+            return candidate  # 当前 XML 即为目标测试报告。 
+    xml_files = [name for name in os.listdir(run_dir) if name.startswith('TEST-') and name.endswith('.xml')]  # 再回退到遍历当前 run 目录里的全部 surefire XML。 
+    if len(xml_files) == 1:  # 只有一个 XML 时直接采用。 
+        return os.path.join(run_dir, xml_files[0])  # 返回唯一的 XML 报告。 
+    for filename in xml_files:  # 多个 XML 时继续尝试按类名后缀模糊匹配。 
+        if entry.test_class in filename:  # 命中目标测试类名时采用当前 XML。 
+            return os.path.join(run_dir, filename)  # 返回匹配到的 XML 报告。 
+    return None  # 最终仍未定位到目标测试报告。 
+
+
+def _parse_nondex_report_result(xml_path: str) -> str:  # 从单个 surefire XML 报告中恢复 pass/fail/error 结果。 
+    try:  # XML 可能损坏，需要保守解析。 
+        root = ET.parse(xml_path).getroot()  # 读取 XML 根节点。 
+    except (ET.ParseError, OSError):  # 报告损坏或不可读时统一视为 error。 
+        return 'error'  # 当前轮结果无法可靠恢复。 
+    tests = int(root.attrib.get('tests', '0') or '0')  # 读取 surefire 记录的测试数量。 
+    failures = int(root.attrib.get('failures', '0') or '0')  # 读取失败数量。 
+    errors = int(root.attrib.get('errors', '0') or '0')  # 读取错误数量。 
+    if tests <= 0:  # 没有真正执行测试时更接近基础设施 error。 
+        return 'error'  # 将其记为 error 而不是 fail。 
+    if failures > 0 or errors > 0:  # 只要测试断言失败或测试内异常都视为 fail。 
+        return 'fail'  # 返回测试执行失败。 
+    return 'pass'  # 其余情况都视为成功通过。 
+
+
+def _normalize_nondex_runs(parsed_results: List[Tuple[str, str]], desired_total_runs: int) -> List[Tuple[str, str]]:  # 将 clean 基线放到最前，并裁剪或补齐到用户请求的总次数。 
+    clean_runs = [item for item in parsed_results if item[1].startswith('clean_')]  # NonDex clean 基线 run id 以 `clean_` 开头。 
+    perturbed_runs = [item for item in parsed_results if not item[1].startswith('clean_')]  # 其余 run 视作实现扰动结果。 
+    normalized = clean_runs + perturbed_runs  # 统一输出顺序为 `clean baseline -> perturbed runs`。 
+    if len(normalized) >= desired_total_runs:  # 当前结果数足够时直接裁剪。 
+        return normalized[:desired_total_runs]  # 保留用户请求的前 N 个结果。 
+    missing_count = desired_total_runs - len(normalized)  # 计算还缺多少轮结果。 
+    normalized.extend([('error', f'missing_{idx + 1}') for idx in range(missing_count)])  # 对缺失轮次补齐 error，避免 silently 丢结果。 
+    logger.warning(f"NonDex internal runs were incomplete; padded {missing_count} missing runs as error")  # 记录当前批次结果不完整。 
+    return normalized  # 返回补齐后的标准化结果序列。 
+
+
+def _normalize_output_run_results(parsed_results: List[str], desired_total_runs: int) -> List[str]:  # 将基于命令输出恢复的结果序列裁剪或补齐到期望长度。
+    if not parsed_results:  # 没有从输出里恢复出任何结果时直接返回空列表。
+        return []  # 让调用方继续回退到更粗粒度的解析。
+    normalized_results = list(parsed_results[:desired_total_runs])  # 先裁剪到用户请求的总次数。
+    if len(normalized_results) >= desired_total_runs:  # 输出恢复结果足够时直接返回。
+        return normalized_results  # 保持当前恢复顺序不变。
+    missing_count = desired_total_runs - len(normalized_results)  # 计算还缺多少轮结果。
+    normalized_results.extend(['error'] * missing_count)  # 缺失轮次统一补齐为 error，避免 silently 丢结果。
+    logger.warning(f"NonDex output runs were incomplete; padded {missing_count} missing runs as error")  # 记录输出恢复结果数量不足。
+    return normalized_results  # 返回补齐后的结果序列。
+
+
+def _prefer_nondex_output_results(manifest_results: List[str], output_results: List[str]) -> List[str]:  # 在 manifest 恢复和输出恢复之间选择信息量更高的一组结果。
+    if not output_results:  # 没有输出恢复结果时只能使用 manifest 恢复。
+        return manifest_results  # 返回 manifest 结果。
+    if not manifest_results:  # manifest 没有恢复结果时直接使用输出恢复。
+        return output_results  # 返回输出恢复结果。
+    manifest_error_count = manifest_results.count('error')  # 统计 manifest 恢复里的 error 数量。
+    output_error_count = output_results.count('error')  # 统计输出恢复里的 error 数量。
+    if len(output_results) == len(manifest_results) and output_error_count < manifest_error_count:  # 两者轮数一致但输出恢复更少 error 时，优先相信输出恢复。
+        return output_results  # 避免 `.nondex` 目录被清理后整批误判成 RUN_ERROR。
+    if manifest_error_count == len(manifest_results) and output_error_count < manifest_error_count:  # manifest 全部掉成 error 时，只要输出恢复更好就直接替换。
+        return output_results  # 返回信息量更高的输出恢复结果。
+    return manifest_results  # 其余情况继续优先使用 manifest 恢复结果。
+
+
+def _parse_nondex_output_runs(output: str) -> List[str]:  # 当 `.nondex` 目录或 XML 报告不可用时，从 NonDex 命令输出中恢复每轮结果。
+    normalized_output = output or ''  # 统一处理空输出。
+    if not normalized_output.strip():  # 空输出无法恢复任何批量结果。
+        return []  # 让调用方继续走更粗粒度的回退逻辑。
+    blocks = _split_nondex_output_blocks(normalized_output)  # 先把 clean baseline 和每个扰动 run 分成独立区块。
+    parsed_results: List[str] = []  # 保存从输出区块里恢复出的结果序列。
+    for block in blocks:  # 逐块恢复当前 run 的 pass/fail/error。
+        block_result = _classify_nondex_output_block(block)  # 根据当前区块里的 surefire 摘要和 NonDex 总结判断结果。
+        if block_result:  # 只有当前区块成功识别出结果时才纳入最终序列。
+            parsed_results.append(block_result)  # 保留当前区块对应的一轮结果。
+    return parsed_results  # 返回从命令输出中恢复出的完整结果序列。
+
+
+def _split_nondex_output_blocks(output: str) -> List[str]:  # 将 NonDex 批量命令输出拆成 clean baseline 和每个扰动 run 的独立区块。
+    execid_pattern = re.compile(r'(?:^|\n).*?(?:-DnondexExecid=|nondexExecid=)', re.IGNORECASE)  # 执行输出里每个扰动 run 都会带有一个 execid，可用于切块。
+    matches = list(execid_pattern.finditer(output))  # 找出当前输出里所有 execid 出现位置。
+    if not matches:  # 某些日志裁剪场景下可能没有 execid，此时只能把整段输出当成一个区块。
+        return [output] if output.strip() else []  # 返回单区块列表，交给后续分类器判断。
+    blocks: List[str] = []  # 保存切好的输出区块。
+    baseline_block = output[:matches[0].start()].strip()  # execid 之前通常是 clean baseline 的完整 surefire 输出。
+    if baseline_block:  # 只有存在 clean baseline 输出时才加入区块列表。
+        blocks.append(baseline_block)  # 先保留 clean baseline 区块。
+    for idx, match in enumerate(matches):  # 再顺序切出每个扰动 run 的区块。
+        start = match.start()  # 当前 run 区块的起点。
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(output)  # 下一个 execid 或整段输出末尾。
+        block = output[start:end].strip()  # 截取当前扰动 run 的完整文本区块。
+        if block:  # 只保留非空区块。
+            blocks.append(block)  # 追加当前 run 区块。
+    return blocks  # 返回顺序稳定的输出区块列表。
+
+
+def _classify_nondex_output_block(block: str) -> str:  # 根据单个 NonDex 输出区块恢复该轮运行的 pass/fail/error 结果。
+    normalized_block = block or ''  # 统一处理空区块。
+    block_lower = normalized_block.lower()  # 统一转成小写，便于做大小写无关的文本匹配。
+    failure_summary_pattern = re.compile(r'Tests run:\s*(\d+),\s*Failures:\s*(\d+),\s*Errors:\s*(\d+)', re.IGNORECASE)  # 复用 surefire 摘要模式从区块里提取真实测试统计。
+    failure_summaries = [(int(total), int(failures), int(errors)) for total, failures, errors in failure_summary_pattern.findall(normalized_block)]  # 解析当前区块里所有测试摘要行。
+    if any((failures > 0 or errors > 0) and total > 0 for total, failures, errors in failure_summaries):  # 只要当前区块里真的执行过测试且出现失败，就应当明确记为 fail。
+        return 'fail'  # 当前 run 对应真实测试失败。
+    if any(total > 0 for total, _, _ in failure_summaries):  # 区块里执行过至少一个测试且没有失败时视为 pass。
+        return 'pass'  # 当前 run 对应真实测试通过。
+    if 'no test failed with this configuration' in block_lower:  # 某些裁剪后的 NonDex SUMMARY 只保留了这一句结论。
+        return 'pass'  # 当前配置没有触发失败，因此视为 pass。
+    explicit_failure_indicators = [  # 当 surefire 摘要不完整时，再用这些常见文本兜底识别 fail。
+        'there are test failures',  # Maven Surefire 常见失败提示。
+        'failing tests:',  # NonDex 总结里常见的失败列表头。
+        'failed tests:',  # Surefire 失败列表头。
+        '<<< failure!',  # Surefire 明细失败标记。
+        '<<< error!',  # Surefire 明细错误标记。
+        'comparisonfailure',  # 常见断言失败类型。
+        'assertionerror',  # 常见断言失败异常。
+    ]  # 这些标记说明测试已经真正进入执行阶段。
+    if any(indicator in block_lower for indicator in explicit_failure_indicators):  # 命中这些文本时优先记为 fail。
+        return 'fail'  # 当前 run 更接近测试失败而不是基础设施错误。
+    if _parse_test_result(1, normalized_block) == 'error':  # 最后复用现有的单轮解析逻辑识别编译失败、依赖失败和无测试等 error 场景。
+        return 'error'  # 当前 run 没有真正完成目标测试执行。
+    return ''  # 既没有足够证据判定 pass/fail，也没有明确 error 时返回空串让调用方忽略该区块。
+
+
+def _estimate_batched_checkpoint_elapsed_seconds(total_elapsed_seconds: float, total_runs: int, checkpoints: List[int]) -> Dict[int, float]:  # 为批量执行后端按 run 占比近似关键阶段壁钟耗时。 
+    if total_runs <= 0:  # 理论上的安全保护。 
+        return {checkpoint: 0.0 for checkpoint in checkpoints}  # 当前没有有效 run 数时统一填 0。 
+    return {checkpoint: total_elapsed_seconds * (checkpoint / total_runs) for checkpoint in checkpoints}  # 按 run 数占比线性分配总壁钟时间。 
 
 
 def _run_gradle_test(repo_dir: str, entry: TestEntry, mode: RerunMode,
@@ -854,8 +1140,11 @@ def _maven_stability_flags(include_test_failure_ignore: bool = False) -> List[st
         '-Dstyle.color=never',  # 关闭 ANSI 彩色输出，方便后续日志解析。
         '-Drat.skip=true',  # 跳过 Apache RAT 许可证扫描。
         '-Dcheckstyle.skip=true',  # 跳过 Checkstyle 校验。
+        '-DskipCheckstyle=true',  # 兼容部分父 pom 或自定义 profile 使用 `skipCheckstyle` 作为开关的场景。
+        '-Dskip.checkstyle=true',  # 兼容少数项目把跳过开关写成 `skip.checkstyle` 的场景。
         '-Dpmd.skip=true',  # 跳过 PMD 静态检查，避免 botbuilder-java 一类项目在 test-compile 前就被质量门拦下。
         '-DskipPmd=true',  # 兼容部分项目使用 skipPmd 作为统一开关的写法。
+        '-Dbasepom.check.skip-checkstyle=true',  # 兼容 basepom 风格的 Checkstyle 开关，避免只加 `checkstyle.skip` 仍被父 pom 拦下。
         '-Dbasepom.check.skip-pmd=true',  # 兼容 HubSpot basepom 风格的 PMD 跳过开关。
         '-Denforcer.skip=true',  # 跳过 Enforcer 版本与环境校验。
         '-Dspotbugs.skip=true',  # 跳过 SpotBugs 分析。
@@ -881,10 +1170,18 @@ def _maven_stability_flags(include_test_failure_ignore: bool = False) -> List[st
         '-Dskip.installnodeandyarn=true',  # 兼容 frontend-maven-plugin 的 Node/Yarn 安装跳过属性名。
         '-Dskip.npm=true',  # 尝试关闭 NPM 相关步骤，减少与目标测试无关的前端噪声。
         '-Dskip.yarn=true',  # 尝试关闭 Yarn 相关步骤，减少与目标测试无关的前端噪声。
+        '-Dspring-javaformat.skip=true',  # Spring Cloud 体系常见的 spring-javaformat 也会在 test-compile 前阻断构建。
     ]  # 这些参数主要减少与测试本身无关的失败来源。
     if include_test_failure_ignore:  # 仅测试阶段需要让 Maven 即使遇到失败用例也尽量保留完整输出。
         flags.append('-Dmaven.test.failure.ignore=true')  # 让我们可以基于日志自行区分 fail 与 error。
     return flags  # 返回追加到 Maven 命令尾部的稳定性参数。
+
+
+def _nondex_batch_timeout(timeout: int, total_runs: int) -> int:  # 为一次批量 NonDex 实验计算更符合 `1次基线 + N-1次扰动` 语义的整体超时预算。
+    normalized_timeout = max(1, timeout)  # 保护性兜底，避免传入 0 或负数时得到非法超时。
+    normalized_runs = max(1, total_runs)  # 至少按一次 clean baseline 计算。
+    multiplier = 6 if normalized_runs >= 50 else max(1, (normalized_runs + 9) // 10)  # 50 轮 ID 实验是当前最常见的大批次，需要给 clean baseline 和完整扰动批次额外留出一档预算。
+    return normalized_timeout * multiplier  # 返回适用于整批 NonDex 命令的统一超时预算。
 
 
 def _get_build_env(repo_dir: str) -> dict:  # 为本地构建与测试命令生成隔离后的环境变量集合。
